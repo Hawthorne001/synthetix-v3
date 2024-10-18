@@ -4,7 +4,6 @@ pragma solidity >=0.8.11 <0.9.0;
 import {IMarket} from "@synthetixio/main/contracts/interfaces/external/IMarket.sol";
 import {IPyth} from "@synthetixio/oracle-manager/contracts/interfaces/external/IPyth.sol";
 import {ISynthetixSystem} from "../external/ISynthetixSystem.sol";
-import {ISpotMarketSystem} from "../external/ISpotMarketSystem.sol";
 import {PerpMarket} from "../storage/PerpMarket.sol";
 import {IBasePerpMarket} from "./IBasePerpMarket.sol";
 
@@ -14,13 +13,26 @@ interface IPerpMarketFactoryModule is IMarket, IBasePerpMarket {
     struct CreatePerpMarketParameters {
         /// Name of the market to be created e.g, ETHPERP
         bytes32 name;
+        /// Minimum LP delegation time in seconds e.g. 86400
+        uint32 minDelegateTime;
     }
 
     struct DepositedCollateral {
-        /// Id of the spot synth market collateral.
-        uint128 synthMarketId;
+        /// Address of the collateral.
+        address collateralAddress;
         /// Amount of available collateral deposited (unrelated to position).
         uint256 available;
+    }
+
+    struct UtilizationDigest {
+        /// Last computed utilization rate.
+        uint128 lastComputedUtilizationRate;
+        /// Timestamp of last computed utilization rate.
+        uint64 lastComputedTimestamp;
+        /// The current instantaneous utilization rate.
+        uint128 currentUtilizationRate;
+        /// The current instantaneous collateral utilization.
+        uint256 utilization;
     }
 
     struct MarketDigest {
@@ -35,14 +47,14 @@ interface IPerpMarketFactoryModule is IMarket, IBasePerpMarket {
         /// Current oracle price (not accounting for pd adjustments).
         uint256 oraclePrice;
         /// Current rate of funding velocity.
-        int256 fundingVelocity;
+        int128 fundingVelocity;
         /// Current funding rate as a function of funding velocity.
-        int256 fundingRate;
+        int128 fundingRate;
         /// Current utilization rate
-        uint256 utilizationRate;
+        uint128 utilizationRate;
         /// Amount of size remaining last recorded in current window.
-        uint256 remainingLiquidatableSizeCapacity;
-        /// block.timestamp of when the last liqudation had occurred.
+        uint128 remainingLiquidatableSizeCapacity;
+        /// block.timestamp of when the last liquidation had occurred.
         uint128 lastLiquidationTime;
         /// All traders unsettled debt in USD.
         uint128 totalTraderDebtUsd;
@@ -60,14 +72,6 @@ interface IPerpMarketFactoryModule is IMarket, IBasePerpMarket {
     event MarketCreated(uint128 indexed id, bytes32 name);
 
     // --- Mutations --- //
-
-    /// @notice Stores a reference to the Synthetix core system.
-    /// @param synthetix Address of core Synthetix proxy
-    function setSynthetix(ISynthetixSystem synthetix) external;
-
-    /// @notice Stores a reference to the Synthetix spot market system.
-    /// @param spotMarket Address of Synthetix spot market proxy
-    function setSpotMarket(ISpotMarketSystem spotMarket) external;
 
     /// @notice Stores a reference to the Pyth EVM contract.
     /// @param pyth Address of Pyth verification contract
@@ -90,12 +94,19 @@ interface IPerpMarketFactoryModule is IMarket, IBasePerpMarket {
 
     // --- Views --- //
 
-    /**
-     * @notice Returns a digest of an existing market given the `marketId`.
-     */
+    /// @notice Returns a digest of an existing market given the `marketId`.
+    /// @param marketId Market to query against
+    /// @return getMarketDigest Market digest struct
     function getMarketDigest(
         uint128 marketId
     ) external view returns (IPerpMarketFactoryModule.MarketDigest memory);
+
+    /// @notice Returns a the utilization digest of an existing market given their `marketId`.
+    /// @param marketId Market to query the digest against
+    /// @return getUtilizationDigest Utilization digest struct
+    function getUtilizationDigest(
+        uint128 marketId
+    ) external view returns (IPerpMarketFactoryModule.UtilizationDigest memory);
 
     /// @notice Returns all created market ids in the system.
     /// @return getActiveMarketIds An array of market ids

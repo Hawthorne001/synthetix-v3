@@ -9,6 +9,7 @@ import {PerpsMarketConfiguration} from "./PerpsMarketConfiguration.sol";
 import {PerpsMarket} from "./PerpsMarket.sol";
 import {PerpsPrice} from "./PerpsPrice.sol";
 import {PerpsAccount} from "./PerpsAccount.sol";
+import {GlobalPerpsMarket} from "./GlobalPerpsMarket.sol";
 import {MathUtil} from "../utils/MathUtil.sol";
 import {OrderFee} from "./OrderFee.sol";
 import {KeeperCosts} from "./KeeperCosts.sol";
@@ -24,6 +25,7 @@ library AsyncOrder {
     using SafeCastU256 for uint256;
     using PerpsMarketConfiguration for PerpsMarketConfiguration.Data;
     using PerpsMarket for PerpsMarket.Data;
+    using GlobalPerpsMarket for GlobalPerpsMarket.Data;
     using PerpsAccount for PerpsAccount.Data;
     using KeeperCosts for KeeperCosts.Data;
 
@@ -235,7 +237,6 @@ library AsyncOrder {
         uint256 availableMargin;
         uint256 currentLiquidationMargin;
         uint256 accumulatedLiquidationRewards;
-        uint256 currentLiquidationReward;
         int128 newPositionSize;
         uint256 newNotionalValue;
         int256 currentAvailableMargin;
@@ -262,10 +263,12 @@ library AsyncOrder {
         SettlementStrategy.Data storage strategy,
         uint256 orderPrice
     ) internal returns (Position.Data memory, uint256, uint256, Position.Data storage oldPosition) {
+        /// @dev runtime stores order settlement data and prevents stack too deep
         SimulateDataRuntime memory runtime;
-        runtime.sizeDelta = order.request.sizeDelta;
+
         runtime.accountId = order.request.accountId;
         runtime.marketId = order.request.marketId;
+        runtime.sizeDelta = order.request.sizeDelta;
 
         if (runtime.sizeDelta == 0) {
             revert ZeroSizeOrder();
@@ -278,7 +281,7 @@ library AsyncOrder {
             runtime.currentAvailableMargin,
             runtime.requiredInitialMargin,
             ,
-            runtime.currentLiquidationReward
+
         ) = account.isEligibleForLiquidation(PerpsPrice.Tolerance.DEFAULT);
 
         if (runtime.isEligible) {
@@ -299,10 +302,6 @@ library AsyncOrder {
             orderPrice
         );
 
-        if (acceptablePriceExceeded(order, runtime.fillPrice)) {
-            revert AcceptablePriceExceeded(runtime.fillPrice, order.request.acceptablePrice);
-        }
-
         runtime.orderFees =
             calculateOrderFee(
                 runtime.sizeDelta,
@@ -317,7 +316,7 @@ library AsyncOrder {
 
         // only account for negative pnl
         runtime.currentAvailableMargin += MathUtil.min(
-            calculateStartingPnl(runtime.fillPrice, orderPrice, runtime.newPositionSize),
+            calculateFillPricePnl(runtime.fillPrice, orderPrice, runtime.sizeDelta),
             0
         );
 
@@ -348,6 +347,29 @@ library AsyncOrder {
 
         if (runtime.currentAvailableMargin < runtime.totalRequiredMargin.toInt()) {
             revert InsufficientMargin(runtime.currentAvailableMargin, runtime.totalRequiredMargin);
+        }
+
+        /// @dev if new position size is not 0, further credit validation required
+        if (runtime.newPositionSize != 0) {
+            /// @custom:magnitude determines if more market credit is required
+            /// when a position's magnitude is increased, more credit is required and risk increases
+            /// when a position's magnitude is decreased, less credit is required and risk decreases
+            uint256 newMagnitude = MathUtil.abs(runtime.newPositionSize);
+            uint256 oldMagnitude = MathUtil.abs(oldPosition.size);
+
+            /// @custom:side reflects if position is long or short; if side changes, further validation required
+            /// given new position size cannot be zero, it is inconsequential if old size is zero;
+            /// magnitude will necessarily be larger
+            bool sameSide = runtime.newPositionSize > 0 == oldPosition.size > 0;
+
+            // require validation if magnitude has increased or side has not remained the same
+            if (newMagnitude > oldMagnitude || !sameSide) {
+                int256 lockedCreditDelta = perpsMarketData.requiredCreditForSize(
+                    newMagnitude.toInt() - oldMagnitude.toInt(),
+                    PerpsPrice.Tolerance.DEFAULT
+                );
+                GlobalPerpsMarket.load().validateMarketCapacity(lockedCreditDelta);
+            }
         }
 
         runtime.newPosition = Position.Data({
@@ -390,8 +412,25 @@ library AsyncOrder {
             orderPrice
         );
 
-        // check if fill price exceeded acceptable price
-        if (!acceptablePriceExceeded(order, fillPrice)) {
+        Position.Data storage oldPosition = PerpsMarket.accountPosition(
+            order.request.marketId,
+            order.request.accountId
+        );
+        int128 newPositionSize = oldPosition.size + order.request.sizeDelta;
+        int256 lockedCreditDelta = perpsMarketData.requiredCreditForSize(
+            MathUtil.abs(newPositionSize).toInt() - MathUtil.abs(oldPosition.size).toInt(),
+            PerpsPrice.Tolerance.DEFAULT
+        );
+        (bool isMarketSolvent, , ) = GlobalPerpsMarket.load().isMarketSolventForCreditDelta(
+            lockedCreditDelta
+        );
+
+        // Allow to cancel if the cancellation is due to market insolvency while not reducing the order
+        // If not, check if fill price exceeded acceptable price
+        if (
+            (isMarketSolvent || MathUtil.isSameSideReducing(oldPosition.size, newPositionSize)) &&
+            !acceptablePriceExceeded(order, fillPrice)
+        ) {
             revert AcceptablePriceNotExceeded(fillPrice, order.request.acceptablePrice);
         }
     }
@@ -515,14 +554,14 @@ library AsyncOrder {
     }
 
     /**
-     * @notice Initial pnl of a position after it's opened due to p/d fill price delta.
+     * @notice PnL incurred from closing old position/opening new position based on fill price
      */
-    function calculateStartingPnl(
+    function calculateFillPricePnl(
         uint256 fillPrice,
         uint256 marketPrice,
-        int128 size
+        int128 sizeDelta
     ) internal pure returns (int256) {
-        return size.mulDecimal(marketPrice.toInt() - fillPrice.toInt());
+        return sizeDelta.mulDecimal(marketPrice.toInt() - fillPrice.toInt());
     }
 
     /**
@@ -548,7 +587,7 @@ library AsyncOrder {
         // get initial margin requirement for the new position
         (, , runtime.newRequiredMargin, ) = marketConfig.calculateRequiredMargins(
             newPositionSize,
-            fillPrice
+            PerpsPrice.getCurrentPrice(marketId, PerpsPrice.Tolerance.DEFAULT)
         );
 
         // get initial margin of old position
@@ -565,10 +604,13 @@ library AsyncOrder {
             runtime.oldRequiredMargin;
 
         (runtime.accumulatedLiquidationRewards, runtime.maxNumberOfWindows) = account
-            .getKeeperRewardsAndCosts(marketId);
-        runtime.accumulatedLiquidationRewards += marketConfig.calculateFlagReward(
-            MathUtil.abs(newPositionSize).mulDecimal(fillPrice)
-        );
+            .getKeeperRewardsAndCosts(
+                marketId,
+                PerpsPrice.Tolerance.DEFAULT,
+                marketConfig.calculateFlagReward(
+                    MathUtil.abs(newPositionSize).mulDecimal(fillPrice)
+                )
+            );
         runtime.numberOfWindows = marketConfig.numberOfLiquidationWindows(
             MathUtil.abs(newPositionSize)
         );
@@ -584,6 +626,12 @@ library AsyncOrder {
 
         // this is the required margin for the new position (minus any order fees)
         return runtime.requiredMarginForNewPosition + runtime.requiredRewardMargin;
+    }
+
+    function validateAcceptablePrice(Data storage order, uint256 fillPrice) internal view {
+        if (acceptablePriceExceeded(order, fillPrice)) {
+            revert AcceptablePriceExceeded(fillPrice, order.request.acceptablePrice);
+        }
     }
 
     /**
