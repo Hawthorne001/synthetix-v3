@@ -5,6 +5,8 @@ import { createStakedPool } from '@synthetixio/main/test/common';
 import { MockPythExternalNode } from '@synthetixio/oracle-manager/typechain-types';
 import { createPythNode } from '@synthetixio/oracle-manager/test/common';
 import { SynthRouter } from '../generated/typechain';
+import { fastForwardTo, getTime } from '@synthetixio/core-utils/utils/hardhat/rpc';
+import { _SECONDS_IN_DAY } from '../../../perps-market/test/integration/helpers';
 
 export type SynthMarkets = Array<{
   marketId: () => ethers.BigNumber;
@@ -19,6 +21,7 @@ export type SynthArguments = Array<{
   token: string;
   buyPrice: ethers.BigNumber;
   sellPrice: ethers.BigNumber;
+  skewScale?: ethers.BigNumber;
 }>;
 
 export const STRICT_PRICE_TOLERANCE = 60;
@@ -33,7 +36,7 @@ export function bootstrapSynthMarkets(
     [, , marketOwner] = r.signers();
   });
 
-  const synthMarkets: SynthMarkets = data.map(({ name, token, buyPrice, sellPrice }) => {
+  const synthMarkets: SynthMarkets = data.map(({ name, token, buyPrice, sellPrice, skewScale }) => {
     let marketId: ethers.BigNumber,
       buyNodeId: string,
       buyAggregator: MockPythExternalNode,
@@ -77,6 +80,7 @@ export function bootstrapSynthMarkets(
     });
 
     before('delegate collateral to market from pool', async () => {
+      await fastForwardTo((await getTime(r.provider())) + _SECONDS_IN_DAY + 10, r.provider());
       await contracts.Core.connect(r.owner()).setPoolConfiguration(r.poolId, [
         {
           marketId,
@@ -98,6 +102,12 @@ export function bootstrapSynthMarkets(
         depositingEnabled: false,
       });
     });
+
+    if (skewScale) {
+      before('set skew scale', async () => {
+        await contracts.SpotMarket.connect(marketOwner).setMarketSkewScale(marketId, skewScale);
+      });
+    }
 
     return {
       marketId: () => marketId,

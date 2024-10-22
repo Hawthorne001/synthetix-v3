@@ -10,6 +10,7 @@ import {Flags} from "../utils/Flags.sol";
 import {PerpsMarket} from "../storage/PerpsMarket.sol";
 import {AsyncOrder} from "../storage/AsyncOrder.sol";
 import {Position} from "../storage/Position.sol";
+import {MarketUpdate} from "../storage/MarketUpdate.sol";
 import {GlobalPerpsMarket} from "../storage/GlobalPerpsMarket.sol";
 import {SettlementStrategy} from "../storage/SettlementStrategy.sol";
 import {PerpsMarketFactory} from "../storage/PerpsMarketFactory.sol";
@@ -61,103 +62,127 @@ contract AsyncOrderSettlementPythModule is
     }
 
     /**
-     * @dev used for settleing an order.
+     * @notice Settles an offchain order
+     * @param price provided by offchain oracle
+     * @param asyncOrder to be validated and settled
+     * @param settlementStrategy used to validate order and calculate settlement reward
      */
     function _settleOrder(
         uint256 price,
         AsyncOrder.Data storage asyncOrder,
         SettlementStrategy.Data storage settlementStrategy
     ) private {
+        /// @dev runtime stores order settlement data; circumvents stack limitations
         SettleOrderRuntime memory runtime;
+
         runtime.accountId = asyncOrder.request.accountId;
         runtime.marketId = asyncOrder.request.marketId;
-        // check if account is flagged
+        runtime.sizeDelta = asyncOrder.request.sizeDelta;
+
         GlobalPerpsMarket.load().checkLiquidation(runtime.accountId);
 
         Position.Data storage oldPosition;
+
+        // Load the market before settlement to capture the original market size
+        PerpsMarket.Data storage market = PerpsMarket.loadValid(runtime.marketId);
+        uint256 originalMarketSize = market.size;
+
+        // validate order request can be settled; call reverts if not
         (runtime.newPosition, runtime.totalFees, runtime.fillPrice, oldPosition) = asyncOrder
             .validateRequest(settlementStrategy, price);
 
-        runtime.amountToDeduct = runtime.totalFees;
-        runtime.sizeDelta = asyncOrder.request.sizeDelta;
+        // validate final fill price is acceptable relative to price specified by trader
+        asyncOrder.validateAcceptablePrice(runtime.fillPrice);
 
         PerpsMarketFactory.Data storage factory = PerpsMarketFactory.load();
         PerpsAccount.Data storage perpsAccount = PerpsAccount.load(runtime.accountId);
 
-        // use fill price to calculate realized pnl
+        // use actual fill price to calculate realized pnl
         (runtime.pnl, , runtime.chargedInterest, runtime.accruedFunding, , ) = oldPosition.getPnl(
             runtime.fillPrice
         );
-        runtime.pnlUint = MathUtil.abs(runtime.pnl);
 
-        if (runtime.pnl > 0) {
-            perpsAccount.updateCollateralAmount(SNX_USD_MARKET_ID, runtime.pnl);
-        } else if (runtime.pnl < 0) {
-            runtime.amountToDeduct += runtime.pnlUint;
-        }
+        runtime.chargedAmount = runtime.pnl - runtime.totalFees.toInt();
+        perpsAccount.charge(runtime.chargedAmount);
 
-        // after pnl is realized, update position
-        runtime.updateData = PerpsMarket.loadValid(runtime.marketId).updatePositionData(
+        emit AccountCharged(runtime.accountId, runtime.chargedAmount, perpsAccount.debt);
+
+        // only update position state after pnl has been realized
+        runtime.updateData = _processPositionUpdate(price, runtime, market, originalMarketSize);
+        perpsAccount.updateOpenPositions(runtime.marketId, runtime.newPosition.size);
+
+        runtime.settlementReward = AsyncOrder.settlementRewardCost(settlementStrategy);
+
+        // Process fees
+        _processFees(runtime, asyncOrder, factory);
+
+        // Emit events in a helper function
+        _emitSettlementEvents(runtime, asyncOrder);
+
+        // Reset the async order
+        asyncOrder.reset();
+    }
+
+    /// @dev Updates the position and market data
+    function _processPositionUpdate(
+        uint256 price,
+        SettleOrderRuntime memory runtime,
+        PerpsMarket.Data storage market,
+        uint256 originalMarketSize
+    ) internal returns (MarketUpdate.Data memory) {
+        // Update position data
+        MarketUpdate.Data memory updateData = market.updatePositionData(
             runtime.accountId,
             runtime.newPosition
         );
-        perpsAccount.updateOpenPositions(runtime.marketId, runtime.newPosition.size);
 
+        // Calculate the market size delta (change in market size)
+        int256 marketSizeDelta = market.size.toInt() - originalMarketSize.toInt();
+
+        // Emit MarketUpdated event
         emit MarketUpdated(
-            runtime.updateData.marketId,
+            updateData.marketId,
             price,
-            runtime.updateData.skew,
-            runtime.updateData.size,
-            runtime.sizeDelta,
-            runtime.updateData.currentFundingRate,
-            runtime.updateData.currentFundingVelocity,
-            runtime.updateData.interestRate
+            updateData.skew,
+            market.size,
+            marketSizeDelta,
+            updateData.currentFundingRate,
+            updateData.currentFundingVelocity,
+            updateData.interestRate
         );
 
-        // since margin is deposited when trader deposits, as long as the owed collateral is deducted
-        // from internal accounting, fees are automatically realized by the stakers
-        if (runtime.amountToDeduct > 0) {
-            (runtime.deductedSynthIds, runtime.deductedAmount) = perpsAccount.deductFromAccount(
-                runtime.amountToDeduct
-            );
-            for (
-                runtime.synthDeductionIterator = 0;
-                runtime.synthDeductionIterator < runtime.deductedSynthIds.length;
-                runtime.synthDeductionIterator++
-            ) {
-                if (runtime.deductedAmount[runtime.synthDeductionIterator] > 0) {
-                    emit CollateralDeducted(
-                        runtime.accountId,
-                        runtime.deductedSynthIds[runtime.synthDeductionIterator],
-                        runtime.deductedAmount[runtime.synthDeductionIterator]
-                    );
-                }
-            }
-        }
-        runtime.settlementReward =
-            settlementStrategy.settlementReward +
-            KeeperCosts.load().getSettlementKeeperCosts();
+        return updateData;
+    }
 
+    /// @dev Processes the order fees and settlement rewards
+    function _processFees(
+        SettleOrderRuntime memory runtime,
+        AsyncOrder.Data storage asyncOrder,
+        PerpsMarketFactory.Data storage factory
+    ) internal {
+        // if settlement reward is non-zero, pay keeper
         if (runtime.settlementReward > 0) {
-            // pay keeper
             factory.withdrawMarketUsd(ERC2771Context._msgSender(), runtime.settlementReward);
         }
 
-        (runtime.referralFees, runtime.feeCollectorFees) = GlobalPerpsMarketConfiguration
-            .load()
-            .collectFees(
-                runtime.totalFees - runtime.settlementReward, // totalFees includes settlement reward so we remove it
-                asyncOrder.request.referrer,
-                factory
-            );
+        // order fees are total fees minus settlement reward
+        uint256 orderFees = runtime.totalFees - runtime.settlementReward;
+        GlobalPerpsMarketConfiguration.Data storage s = GlobalPerpsMarketConfiguration.load();
 
-        // trader can now commit a new order
-        asyncOrder.reset();
+        (runtime.referralFees, runtime.feeCollectorFees) = s.collectFees(
+            orderFees,
+            asyncOrder.request.referrer,
+            factory
+        );
+    }
 
-        // Note: new event for this due to stack too deep adding it to OrderSettled event
+    /// @dev Emit settlement events in a helper function to reduce stack depth
+    function _emitSettlementEvents(
+        SettleOrderRuntime memory runtime,
+        AsyncOrder.Data memory asyncOrder
+    ) internal {
         emit InterestCharged(runtime.accountId, runtime.chargedInterest);
 
-        // emit event
         emit OrderSettled(
             runtime.marketId,
             runtime.accountId,

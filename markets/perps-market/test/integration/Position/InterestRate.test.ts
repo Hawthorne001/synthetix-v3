@@ -1,12 +1,11 @@
 import { PerpsMarket, bn, bootstrapMarkets } from '../bootstrap';
-import { calculateInterestRate, openPosition } from '../helpers';
+import { calculateInterestRate, openPosition, _SECONDS_IN_DAY } from '../helpers';
 import Wei, { wei } from '@synthetixio/wei';
 import { ethers } from 'ethers';
 import { fastForwardTo, getTime } from '@synthetixio/core-utils/utils/hardhat/rpc';
 import assertBn from '@synthetixio/core-utils/utils/assertions/assert-bignumber';
 import assertEvent from '@synthetixio/core-utils/utils/assertions/assert-event';
 
-const _SECONDS_IN_DAY = 24 * 60 * 60;
 const _SECONDS_IN_YEAR = 31557600;
 
 const _TRADER_SIZE = wei(20);
@@ -71,7 +70,12 @@ describe('Position - interest rates', () => {
       const withdrawableUsd = wei(await systems().Core.getWithdrawableMarketUsd(superMarketId()));
       const totalCollateralValue = wei(await systems().PerpsMarket.totalGlobalCollateralValue());
       const delegatedCollateral = withdrawableUsd.sub(totalCollateralValue);
-      const minCredit = wei(await systems().PerpsMarket.minimumCredit(superMarketId()));
+
+      const snxUsdValue = wei(await systems().PerpsMarket.globalCollateralValue(0));
+      // remove snxUSD collateral value from min credit (which is added in contracts)
+      const minCredit = wei(await systems().PerpsMarket.minimumCredit(superMarketId())).sub(
+        snxUsdValue
+      );
 
       const utilRate = minCredit.div(delegatedCollateral);
       currentInterestRate = calculateInterestRate(utilRate, interestRateParams);
@@ -217,6 +221,25 @@ describe('Position - interest rates', () => {
     });
   });
 
+  describe('add margin to trader 1', () => {
+    let previousMarketInterestRate: Wei;
+    before('update interest rate and add margin', async () => {
+      await systems().PerpsMarket.updateInterestRate();
+      previousMarketInterestRate = wei(await systems().PerpsMarket.interestRate());
+      await systems().PerpsMarket.connect(trader1()).modifyCollateral(2, 0, bn(50_000));
+    });
+
+    before('call manual update', async () => {
+      await systems().PerpsMarket.updateInterestRate();
+    });
+
+    const { currentInterestRate } = checkMarketInterestRate();
+
+    it('does not change interest rate', async () => {
+      assertBn.equal(currentInterestRate().toBN(), previousMarketInterestRate.toBN());
+    });
+  });
+
   describe('change delegated collateral and manual update', () => {
     let previousMarketInterestRate: Wei, marketUpdateTime: number;
     before('identify interest rate', async () => {
@@ -224,6 +247,7 @@ describe('Position - interest rates', () => {
     });
 
     before('undelegate 10%', async () => {
+      await fastForwardTo((await getTime(provider())) + _SECONDS_IN_DAY + 10, provider());
       const currentCollateralAmount = await systems().Core.getPositionCollateral(
         1,
         1,

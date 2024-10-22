@@ -3,6 +3,7 @@ pragma solidity >=0.8.11 <0.9.0;
 
 import "./Config.sol";
 import "./Distribution.sol";
+import "./RewardDistribution.sol";
 import "./MarketConfiguration.sol";
 import "./Vault.sol";
 import "./Market.sol";
@@ -12,6 +13,7 @@ import "./PoolCollateralConfiguration.sol";
 
 import "@synthetixio/core-contracts/contracts/errors/AccessError.sol";
 import "@synthetixio/core-contracts/contracts/utils/SafeCast.sol";
+import "@synthetixio/core-contracts/contracts/utils/RevertUtil.sol";
 import {DecimalMath} from "@synthetixio/core-contracts/contracts/utils/DecimalMath.sol";
 
 /**
@@ -27,6 +29,7 @@ library Pool {
     using Vault for Vault.Data;
     using VaultEpoch for VaultEpoch.Data;
     using Distribution for Distribution.Data;
+    using RewardDistribution for RewardDistribution.Data;
     using DecimalMath for uint256;
     using DecimalMath for int256;
     using DecimalMath for int128;
@@ -35,6 +38,7 @@ library Pool {
     using SafeCastU256 for uint256;
     using SafeCastI128 for int128;
     using SafeCastI256 for int256;
+    using SetUtil for SetUtil.Bytes32Set;
 
     /**
      * @dev Thrown when the specified pool is not found.
@@ -135,6 +139,16 @@ library Pool {
          * If the pool owner sets this value to true, then new collaterals will be disabled for the pool unless a maxDeposit is set for a that collateral.
          */
         bool collateralDisabledByDefault;
+        /**
+         * @dev Tracks reward ids, for pool-wide distributions.
+         */
+        SetUtil.Bytes32Set rewardIds;
+        /**
+         * @dev To allow for rewards to be distributed proportionally to all vaults at a vault level, this data structure
+         * records the proportional amount of rewards that are assigned to each vault (which then correspondingly, gets assigned to users).
+         *
+         */
+        mapping(bytes32 => RewardDistribution.Data) rewardsToVaults;
     }
 
     /**
@@ -294,12 +308,15 @@ library Pool {
     ) internal returns (int256 cumulativeDebtChange) {
         // Update each market's pro-rata liquidity and collect accumulated debt into the pool's debt distribution.
         uint128 myPoolId = self.id;
+        bytes[] memory possibleErrors = new bytes[](self.marketConfigurations.length);
         for (uint256 i = 0; i < self.marketConfigurations.length; i++) {
             Market.Data storage market = Market.load(self.marketConfigurations[i].marketId);
 
-            market.distributeDebtToPools(9999999999);
+            (, possibleErrors[i]) = market.distributeDebtToPools(9999999999);
             cumulativeDebtChange += market.accumulateDebtChange(myPoolId);
         }
+
+        RevertUtil.revertManyIfError(possibleErrors);
 
         assignDebt(self, cumulativeDebtChange);
 
@@ -344,13 +361,15 @@ library Pool {
         address collateralType
     ) internal returns (uint256 collateralPriceD18) {
         // Get the latest collateral price.
-        collateralPriceD18 = CollateralConfiguration.load(collateralType).getCollateralPrice(
-            DecimalMath.UNIT
-        );
+        (uint256 rawCollateralPriceD18, bytes memory possibleError) = CollateralConfiguration
+            .load(collateralType)
+            .getCollateralPrice(DecimalMath.UNIT);
+
+        RevertUtil.revertIfError(possibleError);
 
         // Changes in price update the corresponding vault's total collateral value as well as its liquidity (collateral - debt).
         (uint256 usdWeightD18, ) = self.vaults[collateralType].updateCreditCapacity(
-            collateralPriceD18
+            rawCollateralPriceD18
         );
 
         // Update the vault's shares in the pool's debt distribution, according to the value of its collateral.
@@ -358,6 +377,8 @@ library Pool {
 
         // now that available vault collateral has been recalculated, we should also rebalance the pool markets
         rebalanceMarketsInPool(self);
+
+        collateralPriceD18 = rawCollateralPriceD18;
     }
 
     /**
@@ -370,6 +391,86 @@ library Pool {
     ) internal returns (int256 debtD18) {
         distributeDebtToVaults(self, collateralType);
         return self.vaults[collateralType].consolidateAccountDebt(accountId);
+    }
+
+    /**
+     * @dev Allocates rewards sent at the pool level to vaults so they can be claimed
+     */
+    function updateRewardsToVaults(
+        Data storage self,
+        Vault.PositionSelector memory pos
+    ) internal returns (uint256[] memory rewards, address[] memory distributors, uint256) {
+        bytes32[] memory poolRewardIds = new bytes32[](self.rewardIds.length());
+
+        {
+            uint256 actorId = pos.collateralType.to256();
+            uint256 totalSharesD18 = self.vaultsDebtDistribution.totalSharesD18;
+            uint256 vaultSharesD18 = self.vaultsDebtDistribution.getActorShares(bytes32(actorId));
+
+            for (uint256 i = 0; i < self.rewardIds.length(); i++) {
+                bytes32 rewardId = self.rewardIds.valueAt(i + 1);
+                RewardDistribution.Data storage dist = self.rewardsToVaults[rewardId];
+
+                if (address(dist.distributor) == address(0)) {
+                    continue;
+                }
+
+                dist.rewardPerShareD18 += dist.updateEntry(totalSharesD18).toUint().to128();
+
+                uint256 distAmount = vaultSharesD18.mulDecimal(
+                    dist.rewardPerShareD18 - dist.claimStatus[actorId].lastRewardPerShareD18
+                );
+
+                uint256 vaultTotalShares = self
+                    .vaults[pos.collateralType]
+                    .currentEpoch()
+                    .accountsDebtDistribution
+                    .totalSharesD18;
+
+                // need to make sure we update reward per share or else new vaults in the pool will get rewards they are not supposed to
+                dist.claimStatus[actorId].lastRewardPerShareD18 = dist.rewardPerShareD18;
+
+                // need to set pool reward ids because any newly introduced users in the same pool will similarly need to have their lastreward updated to prevent double reward
+                poolRewardIds[i] = rewardId;
+
+                if (distAmount == 0 || vaultTotalShares == 0) {
+                    continue;
+                }
+
+                // have to set the distributor address here to simplify certain downstream processes
+                self.vaults[pos.collateralType].rewards[rewardId].distributor = dist.distributor;
+                self.vaults[pos.collateralType].rewards[rewardId].rewardPerShareD18 += distAmount
+                    .divDecimal(vaultTotalShares)
+                    .to128();
+            }
+        }
+
+        // update pool level rewards to vaults
+        (uint256[] memory poolAmounts, address[] memory poolAddrs) = self
+            .vaults[pos.collateralType]
+            .updateRewards(pos, poolRewardIds);
+
+        // also update vault level rewards
+        (uint256[] memory vaultAmounts, address[] memory vaultAddrs) = self
+            .vaults[pos.collateralType]
+            .updateRewards(pos, self.vaults[pos.collateralType].rewardIds.values());
+
+        rewards = new uint256[](poolAmounts.length + vaultAmounts.length);
+        distributors = new address[](poolAddrs.length + vaultAddrs.length);
+
+        for (uint256 i = 0; i < rewards.length; i++) {
+            rewards[i] = i < poolAmounts.length
+                ? poolAmounts[i]
+                : vaultAmounts[i - poolAmounts.length];
+        }
+
+        for (uint256 i = 0; i < distributors.length; i++) {
+            distributors[i] = i < poolAddrs.length
+                ? poolAddrs[i]
+                : vaultAddrs[i - poolAddrs.length];
+        }
+
+        return (rewards, distributors, poolAmounts.length);
     }
 
     /**
@@ -464,11 +565,13 @@ library Pool {
         Data storage self,
         address collateralType
     ) internal view returns (uint256 collateralAmountD18, uint256 collateralValueD18) {
-        uint256 collateralPriceD18 = CollateralConfiguration
-            .load(collateralType)
-            .getCollateralPrice(collateralAmountD18);
-
         collateralAmountD18 = self.vaults[collateralType].currentCollateral();
+        (uint256 collateralPriceD18, bytes memory possibleError) = CollateralConfiguration
+            .load(collateralType)
+            .getCollateralPrice(0);
+
+        RevertUtil.revertIfError(possibleError);
+
         collateralValueD18 = collateralPriceD18.mulDecimal(collateralAmountD18);
     }
 
@@ -481,9 +584,12 @@ library Pool {
         uint128 accountId
     ) internal view returns (uint256 collateralAmountD18, uint256 collateralValueD18) {
         collateralAmountD18 = self.vaults[collateralType].currentAccountCollateral(accountId);
-        uint256 collateralPriceD18 = CollateralConfiguration
+        (uint256 collateralPriceD18, bytes memory possibleError) = CollateralConfiguration
             .load(collateralType)
             .getCollateralPrice(collateralAmountD18);
+
+        RevertUtil.revertIfError(possibleError);
+
         collateralValueD18 = collateralPriceD18.mulDecimal(collateralAmountD18);
     }
 
