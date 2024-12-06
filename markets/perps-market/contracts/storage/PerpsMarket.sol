@@ -267,7 +267,10 @@ library PerpsMarket {
         // update position to new position
         // Note: once market interest rate is updated, the current accrued interest is saved
         // to figure out the unrealized interest for the position
-        (uint128 interestRate, uint256 currentInterestAccrued) = InterestRate.update();
+        // when we update market size, use a 1 month price tolerance for calculating minimum credit
+        (uint128 interestRate, uint256 currentInterestAccrued) = InterestRate.update(
+            PerpsPrice.Tolerance.ONE_MONTH
+        );
         oldPosition.update(newPosition, currentInterestAccrued);
 
         return
@@ -412,7 +415,7 @@ library PerpsMarket {
 
     /**
      * @dev Returns the market debt incurred by all positions
-     * @notice  Market debt is the sum of all position sizes multiplied by the price, and old positions pnl that is included in the debt correction accumulator.
+     * @notice Market debt is the sum of all position sizes multiplied by the price, and old positions pnl that is included in the debt correction accumulator.
      */
     function marketDebt(Data storage self, uint256 price) internal view returns (int256) {
         // all positions sizes multiplied by the price is equivalent to skew times price
@@ -423,13 +426,38 @@ library PerpsMarket {
         return positionPnl + fundingPnl - self.debtCorrectionAccumulator;
     }
 
-    function requiredCredit(uint128 marketId) internal view returns (uint256) {
-        return
-            PerpsMarket
-                .load(marketId)
+    /**
+     * @notice calculates the credit a market requires for a given position size
+     * @dev credit required is a function of current market price, size, and locked OI ratio
+     * @param self reference to the market
+     * @param positionSize to calculate how much credit is required
+     * @param tolerance used when querying the current price
+     * @return required credit for the given position size
+     */
+    function requiredCreditForSize(
+        Data storage self,
+        int256 positionSize,
+        PerpsPrice.Tolerance tolerance
+    ) internal view returns (int256 required) {
+        /// @dev credit_required = position_size * current_price * locked_oi_ratio
+        required = positionSize
+            .mulDecimal(PerpsPrice.getCurrentPrice(self.id, tolerance).toInt())
+            .mulDecimal(PerpsMarketConfiguration.load(self.id).lockedOiRatioD18.toInt());
+    }
+
+    function requiredCredits(
+        uint256[] memory marketIds,
+        PerpsPrice.Tolerance tolerance
+    ) internal view returns (uint256[] memory results) {
+        results = PerpsPrice.getCurrentPrices(marketIds, tolerance);
+
+        for (uint256 i = 0; i < results.length; i++) {
+            results[i] = PerpsMarket
+                .load(marketIds[i].to128())
                 .size
-                .mulDecimal(PerpsPrice.getCurrentPrice(marketId, PerpsPrice.Tolerance.DEFAULT))
-                .mulDecimal(PerpsMarketConfiguration.load(marketId).lockedOiRatioD18);
+                .mulDecimal(results[i])
+                .mulDecimal(PerpsMarketConfiguration.load(marketIds[i].to128()).lockedOiRatioD18);
+        }
     }
 
     function accountPosition(

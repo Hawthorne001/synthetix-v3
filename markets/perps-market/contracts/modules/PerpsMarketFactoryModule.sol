@@ -9,6 +9,7 @@ import {PerpsMarketFactory} from "../storage/PerpsMarketFactory.sol";
 import {GlobalPerpsMarket} from "../storage/GlobalPerpsMarket.sol";
 import {PerpsMarket} from "../storage/PerpsMarket.sol";
 import {PerpsPrice} from "../storage/PerpsPrice.sol";
+import {SNX_USD_MARKET_ID} from "../storage/PerpsAccount.sol";
 import {Flags} from "../utils/Flags.sol";
 import {MathUtil} from "../utils/MathUtil.sol";
 import {InterestRate} from "../storage/InterestRate.sol";
@@ -50,11 +51,11 @@ contract PerpsMarketFactoryModule is IPerpsMarketFactoryModule {
         uint128 perpsMarketId;
         if (factory.perpsMarketId == 0) {
             perpsMarketId = factory.initialize(synthetix, spotMarket);
+
+            emit FactoryInitialized(perpsMarketId);
         } else {
             perpsMarketId = factory.perpsMarketId;
         }
-
-        emit FactoryInitialized(perpsMarketId);
 
         return perpsMarketId;
     }
@@ -120,16 +121,19 @@ contract PerpsMarketFactoryModule is IPerpsMarketFactoryModule {
             uint256 collateralValue = globalMarket.totalCollateralValue();
             int256 totalMarketDebt;
 
-            SetUtil.UintSet storage activeMarkets = globalMarket.activeMarkets;
-            uint256 activeMarketsLength = activeMarkets.length();
-            for (uint256 i = 1; i <= activeMarketsLength; i++) {
-                uint128 marketId = activeMarkets.valueAt(i).to128();
-                totalMarketDebt += PerpsMarket.load(marketId).marketDebt(
-                    PerpsPrice.getCurrentPrice(marketId, PerpsPrice.Tolerance.DEFAULT)
-                );
+            uint256[] memory activeMarkets = globalMarket.activeMarkets.values();
+
+            uint256[] memory prices = PerpsPrice.getCurrentPrices(
+                activeMarkets,
+                PerpsPrice.Tolerance.DEFAULT
+            );
+            for (uint256 i = 0; i < activeMarkets.length; i++) {
+                totalMarketDebt += PerpsMarket.load(activeMarkets[i].to128()).marketDebt(prices[i]);
             }
 
-            int256 totalDebt = collateralValue.toInt() + totalMarketDebt;
+            int256 totalDebt = collateralValue.toInt() +
+                totalMarketDebt -
+                globalMarket.totalAccountsDebt.toInt();
             return MathUtil.max(0, totalDebt).toUint();
         }
 
@@ -141,7 +145,11 @@ contract PerpsMarketFactoryModule is IPerpsMarketFactoryModule {
      */
     function minimumCredit(uint128 perpsMarketId) external view override returns (uint256) {
         if (PerpsMarketFactory.load().perpsMarketId == perpsMarketId) {
-            return GlobalPerpsMarket.load().minimumCredit();
+            GlobalPerpsMarket.Data storage globalMarket = GlobalPerpsMarket.load();
+            uint256 minRequiredCredit = globalMarket.minimumCredit(PerpsPrice.Tolerance.DEFAULT);
+
+            // add the sUSD collateral value to the minimum credit since it's used as escrow
+            return minRequiredCredit + globalMarket.collateralAmounts[SNX_USD_MARKET_ID];
         }
 
         return 0;
@@ -163,7 +171,7 @@ contract PerpsMarketFactoryModule is IPerpsMarketFactoryModule {
         override
         returns (uint256 rate, uint256 delegatedCollateral, uint256 lockedCredit)
     {
-        return GlobalPerpsMarket.load().utilizationRate();
+        return GlobalPerpsMarket.load().utilizationRate(PerpsPrice.Tolerance.ONE_MONTH);
     }
 
     /**

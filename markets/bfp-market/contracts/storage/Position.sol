@@ -2,22 +2,22 @@
 pragma solidity >=0.8.11 <0.9.0;
 
 import {DecimalMath} from "@synthetixio/core-contracts/contracts/utils/DecimalMath.sol";
-import {SafeCastI256, SafeCastU256, SafeCastU128, SafeCastI128} from "@synthetixio/core-contracts/contracts/utils/SafeCast.sol";
+import {INodeModule} from "@synthetixio/oracle-manager/contracts/interfaces/INodeModule.sol";
+import {SafeCastI256, SafeCastU256, SafeCastU128} from "@synthetixio/core-contracts/contracts/utils/SafeCast.sol";
 import {ERC2771Context} from "@synthetixio/core-contracts/contracts/utils/ERC2771Context.sol";
 import {Order} from "./Order.sol";
 import {PerpMarket} from "./PerpMarket.sol";
 import {PerpMarketConfiguration} from "./PerpMarketConfiguration.sol";
 import {Margin} from "./Margin.sol";
+import {AddressRegistry} from "./AddressRegistry.sol";
 import {MathUtil} from "../utils/MathUtil.sol";
 import {ErrorUtil} from "../utils/ErrorUtil.sol";
 
 library Position {
-    using DecimalMath for uint256;
-    using DecimalMath for int256;
     using DecimalMath for int128;
     using DecimalMath for uint128;
+    using DecimalMath for uint256;
     using SafeCastU128 for uint128;
-    using SafeCastI128 for int128;
     using SafeCastI256 for int256;
     using SafeCastU256 for uint256;
     using PerpMarket for PerpMarket.Data;
@@ -27,11 +27,12 @@ library Position {
     struct TradeParams {
         int128 sizeDelta;
         uint256 oraclePrice;
+        uint256 pythPrice;
         uint256 fillPrice;
         uint128 makerFee;
         uint128 takerFee;
         uint256 limitPrice;
-        uint256 keeperFeeBufferUsd;
+        uint128 keeperFeeBufferUsd;
     }
 
     struct ValidatedTrade {
@@ -44,8 +45,8 @@ library Position {
 
     struct HealthData {
         uint256 healthFactor;
-        int256 accruedFunding;
-        uint256 accruedUtilization;
+        int128 accruedFunding;
+        uint128 accruedUtilization;
         int256 pnl;
     }
 
@@ -59,17 +60,30 @@ library Position {
         uint128 lastLiquidationTime;
     }
 
+    struct Runtime_validateTrade {
+        uint256 orderFee;
+        uint256 keeperFee;
+        bool positionDecreasing;
+        uint256 discountedNextMarginUsd;
+        uint256 im;
+        uint256 mm;
+        uint256 ethPrice;
+        int256 fillPremium;
+        int128 sizeDelta;
+    }
+
     // --- Storage --- //
 
+    /// @dev Position.Data structs are stored in PerpMarket.Data.positions.
     struct Data {
         /// Size (in native units e.g. swstETH)
         int128 size;
-        /// Block timestamp when position was opened or modified.
-        uint256 entryTime;
         /// The market's accumulated accrued funding at position settlement.
-        int256 entryFundingAccrued;
+        int128 entryFundingAccrued;
         /// The market's accumulated accrued utilization at position settlement.
-        uint256 entryUtilizationAccrued;
+        uint128 entryUtilizationAccrued;
+        /// The raw pyth price the order was settled with.
+        uint256 entryPythPrice;
         /// The fill price at which this position was settled with.
         uint256 entryPrice;
     }
@@ -81,12 +95,11 @@ library Position {
      * a market can have on either side.
      */
     function validateMaxOi(
+        PerpMarket.Data storage market,
         uint256 maxMarketSize,
-        int256 marketSkew,
-        uint256 marketSize,
         int256 currentSize,
         int256 newSize
-    ) internal pure {
+    ) internal view {
         // Allow users to reduce an order no matter the market conditions.
         if (
             MathUtil.sameSide(currentSize, newSize) &&
@@ -97,8 +110,8 @@ library Position {
 
         // Either the user is flipping sides, or they are increasing an order on the same side they're already on;
         // we check that the side of the market their order is on would not break the limit.
-        int256 newSkew = marketSkew - currentSize + newSize;
-        int256 newMarketSize = (marketSize - MathUtil.abs(currentSize) + MathUtil.abs(newSize))
+        int256 newSkew = market.skew - currentSize + newSize;
+        int256 newMarketSize = (market.size - MathUtil.abs(currentSize) + MathUtil.abs(newSize))
             .toInt();
 
         int256 newSideSize;
@@ -120,10 +133,35 @@ library Position {
         }
     }
 
+    /// @dev validates whether the market minimum credit has been met.
+    function validateMinimumCredit(
+        PerpMarket.Data storage market,
+        uint256 oraclePrice,
+        PerpMarketConfiguration.Data storage marketConfig,
+        AddressRegistry.Data memory addresses,
+        int128 positionSize
+    ) internal view {
+        uint256 minimumCredit = market.getMinimumCreditWithPositionSize(
+            marketConfig,
+            oraclePrice,
+            positionSize,
+            addresses
+        );
+
+        int256 delegatedCollateralValueUsd = market.getDelegatedCollateralValueUsd(addresses);
+
+        if (
+            delegatedCollateralValueUsd + market.depositedCollateral[addresses.sUsd].toInt() <
+            minimumCredit.toInt()
+        ) {
+            revert ErrorUtil.InsufficientLiquidity();
+        }
+    }
+
     /**
      * @dev Infers the post settlement marginUsd by deducting the order and keeperFee.
      *
-     * NOTE: The previous margin (which may include a discount on the collteral; used for liquidation checks) includes the
+     * NOTE: The previous margin (which may include a discount on the collateral; used for liquidation checks) includes the
      * previous PnL, accrued funding, fees etc. We `-fee` and `-keeperFee` here as they're deducted on the settlement.
      * This is important as it helps avoid instant liquidations immediately after settlement.
      */
@@ -135,42 +173,13 @@ library Position {
         return MathUtil.max(marginUsd.toInt() - orderFee.toInt() - keeperFee.toInt(), 0).toUint();
     }
 
-    /**
-     * @dev Validates whether the `newPosition` can be liquidated.
-     *
-     * NOTE: We expect marginUsd here to be the discount adjusted margin due to liquidation checks as margin checks
-     * for liquidations are expected to discount the collateral.
-     */
-    function validateNextPositionEnoughMargin(
-        Position.Data memory newPosition,
-        uint256 oraclePrice,
-        uint256 mm,
-        uint256 nextMarginUsd
-    ) internal pure {
-        // Delta between oracle and fillPrice (pos.entryPrice) may be large if settled on a very skewed market (i.e
-        // a high premium paid). This can lead to instant liquidation on the settle so we deduct that difference from
-        // the margin before verifying the health factor to account for the premium.
-        //
-        // NOTE: The `min(delta, 0)` as we only want to _reduce_ their remaining margin, not increase it in the case where
-        // a discount is applied for reducing skew.
-        int256 fillPremium = MathUtil.min(
-            newPosition.size.mulDecimal(oraclePrice.toInt() - newPosition.entryPrice.toInt()),
-            0
-        );
-        uint256 remainingMarginUsd = MathUtil.max(nextMarginUsd.toInt() + fillPremium, 0).toUint();
-
-        uint256 healthFactor = remainingMarginUsd.divDecimal(mm);
-
-        if (healthFactor <= DecimalMath.UNIT) {
-            revert ErrorUtil.CanLiquidatePosition();
-        }
-    }
-
     /// @dev Validates whether the given `TradeParams` would lead to a valid next position.
     function validateTrade(
         uint128 accountId,
         PerpMarket.Data storage market,
-        Position.TradeParams memory params
+        Position.TradeParams memory params,
+        PerpMarketConfiguration.Data storage marketConfig,
+        AddressRegistry.Data memory addresses
     ) internal view returns (Position.ValidatedTrade memory) {
         // Empty order is a no.
         if (params.sizeDelta == 0) {
@@ -178,14 +187,15 @@ library Position {
         }
 
         Position.Data storage currentPosition = market.positions[accountId];
-        PerpMarketConfiguration.Data storage marketConfig = PerpMarketConfiguration.load(market.id);
+        Runtime_validateTrade memory runtime;
 
         // --- Existing position validation --- //
 
         Margin.MarginValues memory marginValuesForLiqValidation = Margin.getMarginUsd(
             accountId,
             market,
-            params.oraclePrice
+            params.oraclePrice,
+            addresses
         );
 
         // There's an existing position. Make sure we have a valid existing position before allowing modification.
@@ -199,10 +209,10 @@ library Position {
             if (
                 isLiquidatable(
                     currentPosition,
-                    market,
                     params.oraclePrice,
                     marketConfig,
-                    marginValuesForLiqValidation
+                    marginValuesForLiqValidation,
+                    addresses
                 )
             ) {
                 revert ErrorUtil.CanLiquidatePosition();
@@ -212,94 +222,126 @@ library Position {
         // --- New position validation (as though the order settled) --- //
 
         // Derive fees incurred and next position if this order were to be settled successfully.
-        uint256 orderFee = Order.getOrderFee(
+        runtime.orderFee = Order.getOrderFee(
             params.sizeDelta,
             params.fillPrice,
             market.skew,
             params.makerFee,
             params.takerFee
         );
-        uint256 keeperFee = Order.getSettlementKeeperFee(params.keeperFeeBufferUsd);
+
+        runtime.ethPrice = INodeModule(addresses.oracleManager)
+            .process(PerpMarketConfiguration.load().ethOracleNodeId)
+            .price
+            .toUint();
+
+        runtime.keeperFee = Order.getSettlementKeeperFee(
+            params.keeperFeeBufferUsd,
+            runtime.ethPrice
+        );
+
         Position.Data memory newPosition = Position.Data(
             currentPosition.size + params.sizeDelta,
-            block.timestamp,
             market.currentFundingAccruedComputed,
             // Since utilization wont be recomputed here we need to manually add the unrecorded utilization.
             market.currentUtilizationAccruedComputed + market.getUnrecordedUtilization(),
+            params.pythPrice,
             params.fillPrice
         );
 
-        // Stack too deep.
-        {
-            // Minimum position margin checks. If a position is decreasing (i.e. derisking by lowering size), we
-            // avoid this completely due to positions at min margin would never be allowed to lower size.
-            bool positionDecreasing = MathUtil.sameSide(currentPosition.size, newPosition.size) &&
-                MathUtil.abs(newPosition.size) < MathUtil.abs(currentPosition.size);
-            if (!positionDecreasing) {
-                // We need discounted margin collateral as we're verifying for liquidation here.
-                //
-                // NOTE: `marginUsd` looks at the current overall PnL but it does not consider the 'post' settled
-                // incurred fees hence get `getNextMarginUsd` -fees.
-                uint256 discountedNextMarginUsd = getNextMarginUsd(
+        // Minimum position margin checks. If a position is decreasing (i.e. derisking by lowering size), we
+        // avoid this completely due to positions at min margin would never be allowed to lower size.
+        runtime.positionDecreasing =
+            MathUtil.sameSide(currentPosition.size, newPosition.size) &&
+            MathUtil.abs(newPosition.size) < MathUtil.abs(currentPosition.size);
+
+        (runtime.im, runtime.mm) = getLiquidationMarginUsd(
+            newPosition.size,
+            params.oraclePrice,
+            marginValuesForLiqValidation.collateralUsd,
+            marketConfig,
+            addresses
+        );
+
+        // Compute the net size difference as the fillPremium is only applied on the change in size and not total.
+        runtime.sizeDelta = newPosition.size - currentPosition.size;
+        // Delta between oracle and fillPrice (pos.entryPrice) may be large if settled on a very skewed market (i.e
+        // a high premium paid). This can lead to instant liquidation on the settle so we deduct that difference from
+        // the margin before verifying the health factor to account for the premium.
+        //
+        // NOTE: The `min(delta, 0)` as we only want to _reduce_ their remaining margin, not increase it in the case where
+        // a discount is applied for reducing skew.
+        runtime.fillPremium = MathUtil.min(
+            runtime.sizeDelta.mulDecimal(
+                params.oraclePrice.toInt() - newPosition.entryPrice.toInt()
+            ),
+            0
+        );
+
+        // We need discounted margin collateral as we're verifying for liquidation here.
+        //
+        // NOTE: We create the new margin manually rather than using `marginValuesForLiqValidation.discountedMarginUsd`
+        // as the pnl adjustment for that margin is based on the `oraclePrice` rather than the `fillPrice`. Also, when
+        // this order settles the pnl will be realized with the fill price. Finally, we also need to deduct fees for
+        // settling this order.
+        runtime.discountedNextMarginUsd = MathUtil
+            .max(
+                getNextMarginUsd(
                     marginValuesForLiqValidation.discountedMarginUsd,
-                    orderFee,
-                    keeperFee
-                );
-                (uint256 im, uint256 mm, ) = getLiquidationMarginUsd(
-                    newPosition.size,
-                    params.oraclePrice,
-                    marginValuesForLiqValidation.collateralUsd,
-                    marketConfig
-                );
+                    runtime.orderFee,
+                    runtime.keeperFee
+                ).toInt() + runtime.fillPremium,
+                0
+            )
+            .toUint();
 
-                // Check new position initial margin validations.
-                if (discountedNextMarginUsd < im) {
-                    revert ErrorUtil.InsufficientMargin();
-                }
-
-                // Check new position margin validations.
-                validateNextPositionEnoughMargin(
-                    newPosition,
-                    params.oraclePrice,
-                    mm,
-                    discountedNextMarginUsd
-                );
-
-                // Check the new position hasn't hit max OI on either side.
-                validateMaxOi(
-                    marketConfig.maxMarketSize,
-                    market.skew,
-                    market.size,
-                    currentPosition.size,
-                    newPosition.size
-                );
+        if (runtime.positionDecreasing) {
+            // Position can be liquidatable due to fees, even if decreasing. This can't happen if closed completely.
+            if (
+                newPosition.size != 0 &&
+                runtime.discountedNextMarginUsd.divDecimal(runtime.mm) <= DecimalMath.UNIT
+            ) {
+                revert ErrorUtil.CanLiquidatePosition();
             }
+        } else {
+            // Check the minimum credit requirements are still met.
+            validateMinimumCredit(
+                market,
+                params.oraclePrice,
+                marketConfig,
+                addresses,
+                (MathUtil.abs(newPosition.size).toInt() -
+                    MathUtil.abs(currentPosition.size).toInt()).to128()
+            );
+
+            // Check new position margin validations.
+            if (runtime.discountedNextMarginUsd < runtime.im) {
+                revert ErrorUtil.InsufficientMargin();
+            }
+
+            // Check the new position hasn't hit max OI on either side.
+            validateMaxOi(
+                market,
+                marketConfig.maxMarketSize,
+                currentPosition.size,
+                newPosition.size
+            );
         }
 
-        // NOTE: Notice the lack of discount here as `settleOrder` requires the next non-discounted margin
-        // to realize any PnL against the new position post settlement.
-        //
-        // Refer to `settleOrder` for more details.
-        uint256 nextMarginUsd = getNextMarginUsd(
-            MathUtil
-                .max(
-                    // Even though these marginValues are for liquidation checks, the `collateralUsd` can
-                    // still be used here. To compute the margin, we just need to attribute any PnL adjustments
-                    // to the collateral (e.g. price PnL, funding, debt etc.).
-                    marginValuesForLiqValidation.collateralUsd.toInt() +
-                        Margin.getPnlAdjustmentUsd(accountId, market, params.fillPrice),
-                    0
-                )
-                .toUint(),
-            orderFee,
-            keeperFee
+        // Create and return a validated trade struct for downstream processing.
+        int256 marginUsdForNextMarginUsd = marginValuesForLiqValidation.collateralUsd.toInt() +
+            Margin.getPnlAdjustmentUsd(accountId, market, params.oraclePrice, params.fillPrice);
+        uint256 newMarginUsd = getNextMarginUsd(
+            MathUtil.max(marginUsdForNextMarginUsd, 0).toUint(),
+            runtime.orderFee,
+            runtime.keeperFee
         );
         return
             Position.ValidatedTrade(
                 newPosition,
-                orderFee,
-                keeperFee,
-                nextMarginUsd,
+                runtime.orderFee,
+                runtime.keeperFee,
+                newMarginUsd,
                 marginValuesForLiqValidation.collateralUsd
             );
     }
@@ -309,7 +351,8 @@ library Position {
         uint128 accountId,
         PerpMarket.Data storage market,
         PerpMarketConfiguration.Data storage marketConfig,
-        PerpMarketConfiguration.GlobalData storage globalConfig
+        PerpMarketConfiguration.GlobalData storage globalConfig,
+        address oracleManagerAddress
     )
         internal
         view
@@ -373,8 +416,7 @@ library Position {
         }
 
         // Determine the resulting position post liquidation.
-        uint256 ethPrice = globalConfig
-            .oracleManager
+        uint256 ethPrice = INodeModule(oracleManagerAddress)
             .process(globalConfig.ethOracleNodeId)
             .price
             .toUint();
@@ -384,9 +426,9 @@ library Position {
             oldPosition.size > 0
                 ? oldPosition.size - liqSize.toInt()
                 : oldPosition.size + liqSize.toInt(),
-            block.timestamp,
             oldPosition.entryFundingAccrued,
             oldPosition.entryUtilizationAccrued,
+            oldPosition.entryPythPrice,
             oldPosition.entryPrice
         );
     }
@@ -408,13 +450,16 @@ library Position {
             ),
             flagExecutionCostInUsd + globalConfig.keeperProfitMarginUsd
         );
-
         uint256 flagFeeWithRewardInUsd = flagFeeInUsd +
             MathUtil.max(notionalValueUsd, collateralUsd).mulDecimal(
                 marketConfig.liquidationRewardPercent
             );
 
-        return MathUtil.min(flagFeeWithRewardInUsd, globalConfig.maxKeeperFeeUsd);
+        uint256 boundedKeeperFeeUsd = MathUtil.min(
+            MathUtil.max(globalConfig.minKeeperFeeUsd, flagFeeWithRewardInUsd),
+            globalConfig.maxKeeperFeeUsd
+        );
+        return boundedKeeperFeeUsd;
     }
 
     /**
@@ -433,13 +478,14 @@ library Position {
         int128 size,
         uint256 price,
         uint256 collateralUsd,
-        PerpMarketConfiguration.Data storage marketConfig
-    ) internal view returns (uint256 im, uint256 mm, uint256 liqFlagReward) {
+        PerpMarketConfiguration.Data storage marketConfig,
+        AddressRegistry.Data memory addresses
+    ) internal view returns (uint256 im, uint256 mm) {
         PerpMarketConfiguration.GlobalData storage globalConfig = PerpMarketConfiguration.load();
 
         // Short-circuit empty position and return zero'd values.
         if (size == 0) {
-            return (0, 0, 0);
+            return (0, 0);
         }
 
         uint128 absSize = MathUtil.abs(size).to128();
@@ -453,18 +499,19 @@ library Position {
         );
         uint256 mmr = imr.mulDecimal(marketConfig.maintenanceMarginScalar);
 
-        uint256 ethPrice = globalConfig
-            .oracleManager
+        uint256 ethPrice = INodeModule(addresses.oracleManager)
             .process(globalConfig.ethOracleNodeId)
             .price
             .toUint();
-        liqFlagReward = getLiquidationFlagReward(
+
+        uint256 liqFlagReward = getLiquidationFlagReward(
             notional,
             collateralUsd,
             ethPrice,
             marketConfig,
             globalConfig
         );
+
         uint256 liqKeeperFee = getLiquidationKeeperFee(
             absSize,
             ethPrice,
@@ -516,7 +563,11 @@ library Position {
         );
         uint256 iterations = getLiquidationIterations(size, maxLiqCapacity);
 
-        return MathUtil.min(liquidationFeeInUsd * iterations, globalConfig.maxKeeperFeeUsd);
+        uint256 boundedKeeperFeeUsd = MathUtil.min(
+            MathUtil.max(globalConfig.minKeeperFeeUsd, liquidationFeeInUsd * iterations),
+            globalConfig.maxKeeperFeeUsd
+        );
+        return boundedKeeperFeeUsd;
     }
 
     /// @dev Returns the health data given the `marketId`, `config`, and position{...} details.
@@ -528,37 +579,70 @@ library Position {
         uint256 positionEntryUtilizationAccrued,
         uint256 price,
         PerpMarketConfiguration.Data storage marketConfig,
-        Margin.MarginValues memory marginValues
+        Margin.MarginValues memory marginValues,
+        AddressRegistry.Data memory addresses
     ) internal view returns (Position.HealthData memory healthData) {
         // We can short-circuit entire getHealthData calcs when size is zero.
         if (size == 0) {
             return healthData;
         }
 
-        (, int256 unrecordedFunding) = market.getUnrecordedFundingWithRate(price);
+        (, int256 unrecordedFunding, ) = market.getUnrecordedFundingWithRate(price);
 
-        healthData.accruedFunding = size.mulDecimal(
-            unrecordedFunding + market.currentFundingAccruedComputed - positionEntryFundingAccrued
-        );
-        healthData.accruedUtilization = MathUtil.abs(size).mulDecimal(price).mulDecimal(
-            market.getUnrecordedUtilization() +
-                market.currentUtilizationAccruedComputed -
-                positionEntryUtilizationAccrued
+        healthData.accruedFunding = size
+            .mulDecimal(
+                unrecordedFunding +
+                    market.currentFundingAccruedComputed -
+                    positionEntryFundingAccrued
+            )
+            .to128();
+        healthData.accruedUtilization = MathUtil
+            .abs(size)
+            .mulDecimal(price)
+            .mulDecimal(
+                market.getUnrecordedUtilization() +
+                    market.currentUtilizationAccruedComputed -
+                    positionEntryUtilizationAccrued
+            )
+            .to128();
+
+        healthData.healthFactor = getHealthFactor(
+            size,
+            price,
+            marketConfig,
+            marginValues,
+            addresses
         );
 
         // Calc the price PnL.
         healthData.pnl = size.mulDecimal(price.toInt() - positionEntryPrice.toInt());
 
+        return healthData;
+    }
+
+    /// @dev Returns the representation of the safety between margin and position (> 1 then safe).
+    function getHealthFactor(
+        int128 size,
+        uint256 price,
+        PerpMarketConfiguration.Data storage marketConfig,
+        Margin.MarginValues memory marginValues,
+        AddressRegistry.Data memory addresses
+    ) internal view returns (uint256) {
+        // A zero sized position means there is no position.
+        if (size == 0) {
+            return type(uint256).max;
+        }
+
         // `margin / mm <= 1` means liquidation.
-        (, uint256 mm, ) = getLiquidationMarginUsd(
+        (, uint256 mm) = getLiquidationMarginUsd(
             size,
             price,
             marginValues.collateralUsd,
-            marketConfig
+            marketConfig,
+            addresses
         );
-        healthData.healthFactor = marginValues.discountedMarginUsd.divDecimal(mm);
 
-        return healthData;
+        return marginValues.discountedMarginUsd.divDecimal(mm);
     }
 
     // --- Member (views) --- //
@@ -566,25 +650,17 @@ library Position {
     /// @dev Returns whether the current position can be liquidated.
     function isLiquidatable(
         Position.Data storage self,
-        PerpMarket.Data storage market,
         uint256 price,
         PerpMarketConfiguration.Data storage marketConfig,
-        Margin.MarginValues memory marginValues
+        Margin.MarginValues memory marginValues,
+        AddressRegistry.Data memory addresses
     ) internal view returns (bool) {
         if (self.size == 0) {
             return false;
         }
-        Position.HealthData memory healthData = Position.getHealthData(
-            market,
-            self.size,
-            self.entryPrice,
-            self.entryFundingAccrued,
-            self.entryUtilizationAccrued,
-            price,
-            marketConfig,
-            marginValues
-        );
-        return healthData.healthFactor <= DecimalMath.UNIT;
+        return
+            Position.getHealthFactor(self.size, price, marketConfig, marginValues, addresses) <=
+            DecimalMath.UNIT;
     }
 
     /// @dev Returns the notional profit or loss based on current price and entry price.
@@ -600,17 +676,21 @@ library Position {
         Position.Data storage self,
         PerpMarket.Data storage market,
         uint256 price
-    ) internal view returns (int256) {
+    ) internal view returns (int128) {
         if (self.size == 0) {
             return 0;
         }
 
-        (, int256 unrecordedFunding) = market.getUnrecordedFundingWithRate(price);
-
+        (, int256 unrecordedFunding, ) = market.getUnrecordedFundingWithRate(price);
         return
-            self.size.mulDecimal(
-                unrecordedFunding + market.currentFundingAccruedComputed - self.entryFundingAccrued
-            );
+            self
+                .size
+                .mulDecimal(
+                    unrecordedFunding +
+                        market.currentFundingAccruedComputed -
+                        self.entryFundingAccrued
+                )
+                .to128();
     }
 
     /// @dev Returns the utilization accrued from when the position was opened to now.
@@ -618,19 +698,21 @@ library Position {
         Position.Data storage self,
         PerpMarket.Data storage market,
         uint256 price
-    ) internal view returns (uint256) {
+    ) internal view returns (uint128) {
         if (self.size == 0) {
             return 0;
         }
 
-        uint256 unrecordedUtilization = market.getUnrecordedUtilization();
+        uint128 unrecordedUtilization = market.getUnrecordedUtilization();
         uint256 notional = MathUtil.abs(self.size).mulDecimal(price);
         return
-            notional.mulDecimal(
-                unrecordedUtilization +
-                    market.currentUtilizationAccruedComputed -
-                    self.entryUtilizationAccrued
-            );
+            notional
+                .mulDecimal(
+                    unrecordedUtilization +
+                        market.currentUtilizationAccruedComputed -
+                        self.entryUtilizationAccrued
+                )
+                .to128();
     }
 
     // --- Member (mutations) --- //
@@ -638,9 +720,9 @@ library Position {
     /// @dev Clears the current position struct in-place of any stored data.
     function update(Position.Data storage self, Position.Data memory data) internal {
         self.size = data.size;
-        self.entryTime = data.entryTime;
         self.entryFundingAccrued = data.entryFundingAccrued;
         self.entryUtilizationAccrued = data.entryUtilizationAccrued;
+        self.entryPythPrice = data.entryPythPrice;
         self.entryPrice = data.entryPrice;
     }
 }

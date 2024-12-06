@@ -35,20 +35,24 @@ contract MarketManagerModule is IMarketManagerModule {
     using AssociatedSystem for AssociatedSystem.Data;
     using Distribution for Distribution.Data;
     using HeapUtil for HeapUtil.Data;
-
     using DecimalMath for uint256;
 
+    /**
+     * @notice USD token slot identifier
+     */
     bytes32 private constant _USD_TOKEN = "USDToken";
+
+    /**
+     * @notice feature flag slot identifiers
+     */
     bytes32 private constant _MARKET_FEATURE_FLAG = "registerMarket";
     bytes32 private constant _DEPOSIT_MARKET_FEATURE_FLAG = "depositMarketUsd";
     bytes32 private constant _WITHDRAW_MARKET_FEATURE_FLAG = "withdrawMarketUsd";
 
+    /**
+     * @notice configuration slot identifiers
+     */
     bytes32 private constant _CONFIG_SET_MARKET_MIN_DELEGATE_MAX = "setMarketMinDelegateTime_max";
-    bytes32 private constant _CONFIG_DEPOSIT_MARKET_USD_FEE_RATIO = "depositMarketUsd_feeRatio";
-    bytes32 private constant _CONFIG_WITHDRAW_MARKET_USD_FEE_RATIO = "withdrawMarketUsd_feeRatio";
-    bytes32 private constant _CONFIG_DEPOSIT_MARKET_USD_FEE_ADDRESS = "depositMarketUsd_feeAddress";
-    bytes32 private constant _CONFIG_WITHDRAW_MARKET_USD_FEE_ADDRESS =
-        "withdrawMarketUsd_feeAddress";
 
     /**
      * @inheritdoc IMarketManagerModule
@@ -71,8 +75,13 @@ contract MarketManagerModule is IMarketManagerModule {
      * @inheritdoc IMarketManagerModule
      */
     function getWithdrawableMarketUsd(uint128 marketId) public view override returns (uint256) {
+        (uint256 depositedCollateralValue, bytes memory possibleError) = Market
+            .load(marketId)
+            .getDepositedCollateralValue();
+        RevertUtil.revertIfError(possibleError);
+
         int256 withdrawable = Market.load(marketId).creditCapacityD18 +
-            Market.load(marketId).getDepositedCollateralValue().toInt();
+            depositedCollateralValue.toInt();
 
         return withdrawable < 0 ? 0 : withdrawable.toUint();
     }
@@ -95,7 +104,11 @@ contract MarketManagerModule is IMarketManagerModule {
      * @inheritdoc IMarketManagerModule
      */
     function getMarketReportedDebt(uint128 marketId) external view override returns (uint256) {
-        return Market.load(marketId).getReportedDebt();
+        (uint256 reportedDebt, bytes memory possibleError) = Market
+            .load(marketId)
+            .getReportedDebt();
+        RevertUtil.revertIfError(possibleError);
+        return reportedDebt;
     }
 
     /**
@@ -109,7 +122,11 @@ contract MarketManagerModule is IMarketManagerModule {
      * @inheritdoc IMarketManagerModule
      */
     function getMarketTotalDebt(uint128 marketId) external view override returns (int256) {
-        return Market.load(marketId).totalDebt();
+        (int256 debt, bytes memory possibleError) = Market.load(marketId).totalDebt();
+
+        RevertUtil.revertIfError(possibleError);
+
+        return debt;
     }
 
     /**
@@ -118,7 +135,9 @@ contract MarketManagerModule is IMarketManagerModule {
     function getMarketDebtPerShare(uint128 marketId) external override returns (int256) {
         Market.Data storage market = Market.load(marketId);
 
-        market.distributeDebtToPools(999999999);
+        (, bytes memory possibleError) = market.distributeDebtToPools(999999999);
+
+        RevertUtil.revertIfError(possibleError);
 
         return market.getDebtPerShare();
     }
@@ -134,7 +153,9 @@ contract MarketManagerModule is IMarketManagerModule {
         returns (uint128[] memory inRangePoolIds, uint128[] memory outRangePoolIds)
     {
         Market.Data storage market = Market.load(marketId);
-        market.distributeDebtToPools(999999999);
+
+        (, bytes memory possibleError) = market.distributeDebtToPools(999999999);
+        RevertUtil.revertIfError(possibleError);
 
         HeapUtil.Data storage inRangePools = market.inRangePools;
         inRangePoolIds = new uint128[](inRangePools.size());
@@ -154,6 +175,43 @@ contract MarketManagerModule is IMarketManagerModule {
     /**
      * @inheritdoc IMarketManagerModule
      */
+    function getMarketPoolMaxDebtPerShare(
+        uint128 marketId,
+        uint128 poolId
+    ) external view override returns (int256) {
+        Market.Data storage market = Market.load(marketId);
+        return market.getPoolMaxDebtPerShare(poolId);
+    }
+
+    /**
+     * @inheritdoc IMarketManagerModule
+     */
+    function getMarketCapacityContributionFromPool(
+        uint128 marketId,
+        uint128 poolId
+    ) external view override returns (uint256) {
+        Market.Data storage market = Market.load(marketId);
+
+        int256 currentValuePerShare = market.poolsDebtDistribution.getValuePerShare();
+        int256 poolMaxValuePerShare = market.getPoolMaxDebtPerShare(poolId);
+
+        // the getCreditCapacityContribution function could throw a confusing error if the max value per share is less than value per share
+        if (currentValuePerShare > poolMaxValuePerShare) {
+            return 0;
+        }
+
+        return
+            market
+                .getCreditCapacityContribution(
+                    market.getPoolCreditCapacity(poolId),
+                    poolMaxValuePerShare
+                )
+                .toUint();
+    }
+
+    /**
+     * @inheritdoc IMarketManagerModule
+     */
     function getMarketPoolDebtDistribution(
         uint128 marketId,
         uint128 poolId
@@ -163,7 +221,10 @@ contract MarketManagerModule is IMarketManagerModule {
         returns (uint256 sharesD18, uint128 totalSharesD18, int128 valuePerShareD27)
     {
         Market.Data storage market = Market.load(marketId);
-        market.distributeDebtToPools(999999999);
+
+        (, bytes memory possibleError) = market.distributeDebtToPools(999999999);
+
+        RevertUtil.revertIfError(possibleError);
 
         Distribution.Data storage poolDistribution = market.poolsDebtDistribution;
         sharesD18 = poolDistribution.getActorShares(poolId.toBytes32());
@@ -202,22 +263,12 @@ contract MarketManagerModule is IMarketManagerModule {
         if (ERC2771Context._msgSender() != market.marketAddress)
             revert AccessError.Unauthorized(ERC2771Context._msgSender());
 
-        feeAmount = amount.mulDecimal(Config.readUint(_CONFIG_DEPOSIT_MARKET_USD_FEE_RATIO, 0));
-        address feeAddress = address(0);
-        address configFeeAddress = Config.readAddress(
-            _CONFIG_DEPOSIT_MARKET_USD_FEE_ADDRESS,
-            address(0)
-        );
-
-        if (feeAmount > 0 && configFeeAddress != address(0)) {
-            feeAddress = configFeeAddress;
-        }
         // verify if the market is authorized to burn the USD for the target
         ITokenModule usdToken = AssociatedSystem.load(_USD_TOKEN).asToken();
 
         // Adjust accounting.
-        market.creditCapacityD18 += (amount - feeAmount).toInt().to128();
-        market.netIssuanceD18 -= (amount - feeAmount).toInt().to128();
+        market.creditCapacityD18 += amount.toInt().to128();
+        market.netIssuanceD18 -= amount.toInt().to128();
 
         // Burn the incoming USD.
         // Note: Instead of burning, we could transfer USD to and from the MarketManager,
@@ -229,11 +280,9 @@ contract MarketManagerModule is IMarketManagerModule {
             amount
         );
 
-        if (feeAmount > 0 && feeAddress != address(0)) {
-            IUSDTokenModule(address(usdToken)).mint(feeAddress, feeAmount);
-
-            emit MarketSystemFeePaid(marketId, feeAmount);
-        }
+        (uint256 depositedCollateralValue, bytes memory possibleError) = market
+            .getDepositedCollateralValue();
+        RevertUtil.revertIfError(possibleError);
 
         emit MarketUsdDeposited(
             marketId,
@@ -242,8 +291,10 @@ contract MarketManagerModule is IMarketManagerModule {
             ERC2771Context._msgSender(),
             market.creditCapacityD18,
             market.netIssuanceD18,
-            market.getDepositedCollateralValue()
+            depositedCollateralValue
         );
+
+        feeAmount = 0;
     }
 
     /**
@@ -262,32 +313,20 @@ contract MarketManagerModule is IMarketManagerModule {
             revert AccessError.Unauthorized(ERC2771Context._msgSender());
 
         // Ensure that the market's balance allows for this withdrawal.
-        feeAmount = amount.mulDecimal(Config.readUint(_CONFIG_WITHDRAW_MARKET_USD_FEE_RATIO, 0));
-        if (amount + feeAmount > getWithdrawableMarketUsd(marketId))
+        if (amount > getWithdrawableMarketUsd(marketId)) {
             revert NotEnoughLiquidity(marketId, amount);
-
-        address feeAddress = address(0);
-        address configFeeAddress = Config.readAddress(
-            _CONFIG_WITHDRAW_MARKET_USD_FEE_ADDRESS,
-            address(0)
-        );
-
-        if (feeAmount > 0 && configFeeAddress != address(0)) {
-            feeAddress = configFeeAddress;
         }
 
         // Adjust accounting.
-        marketData.creditCapacityD18 -= (amount + feeAmount).toInt().to128();
-        marketData.netIssuanceD18 += (amount + feeAmount).toInt().to128();
+        marketData.creditCapacityD18 -= amount.toInt().to128();
+        marketData.netIssuanceD18 += amount.toInt().to128();
 
         // Mint the requested USD.
         AssociatedSystem.load(_USD_TOKEN).asToken().mint(target, amount);
 
-        if (feeAmount > 0 && feeAddress != address(0)) {
-            AssociatedSystem.load(_USD_TOKEN).asToken().mint(feeAddress, feeAmount);
-
-            emit MarketSystemFeePaid(marketId, feeAmount);
-        }
+        (uint256 depositedCollateralValue, bytes memory possibleError) = marketData
+            .getDepositedCollateralValue();
+        RevertUtil.revertIfError(possibleError);
 
         emit MarketUsdWithdrawn(
             marketId,
@@ -296,24 +335,10 @@ contract MarketManagerModule is IMarketManagerModule {
             ERC2771Context._msgSender(),
             marketData.creditCapacityD18,
             marketData.netIssuanceD18,
-            marketData.getDepositedCollateralValue()
-        );
-    }
-
-    /**
-     * @inheritdoc IMarketManagerModule
-     */
-    function getMarketFees(
-        uint128,
-        uint256 amount
-    ) external view override returns (uint256 depositFeeAmount, uint256 withdrawFeeAmount) {
-        depositFeeAmount = amount.mulDecimal(
-            Config.readUint(_CONFIG_DEPOSIT_MARKET_USD_FEE_RATIO, 0)
+            depositedCollateralValue
         );
 
-        withdrawFeeAmount = amount.mulDecimal(
-            Config.readUint(_CONFIG_WITHDRAW_MARKET_USD_FEE_RATIO, 0)
-        );
+        feeAmount = 0;
     }
 
     /**
@@ -323,8 +348,21 @@ contract MarketManagerModule is IMarketManagerModule {
         uint128 marketId,
         uint256 maxIter
     ) external override returns (bool) {
-        return Market.load(marketId).distributeDebtToPools(maxIter);
+        (bool done, bytes memory possibleError) = Market.load(marketId).distributeDebtToPools(
+            maxIter
+        );
+        RevertUtil.revertIfError(possibleError);
+
+        return done;
     }
+
+    /**
+     * @inheritdoc IMarketManagerModule
+     */
+    function getMarketFees(
+        uint128,
+        uint256 amount
+    ) external view override returns (uint256 depositFeeAmount, uint256 withdrawFeeAmount) {}
 
     /**
      * @inheritdoc IMarketManagerModule

@@ -70,8 +70,6 @@ interface IMarketManagerModule {
         uint256 depositedCollateralValue
     );
 
-    event MarketSystemFeePaid(uint128 indexed marketId, uint256 feeAmount);
-
     /**
      * @notice Emitted when a market sets an updated minimum delegation time
      * @param marketId The id of the market that the setting is applied to
@@ -101,7 +99,7 @@ interface IMarketManagerModule {
      * @param marketId The id of the market in which snxUSD will be deposited.
      * @param target The address of the account on who's behalf the deposit will be made.
      * @param amount The amount of snxUSD to be deposited, denominated with 18 decimals of precision.
-     * @return feeAmount the amount of fees paid (billed as additional debt towards liquidity providers)
+     * @return feeAmount Fee collected by the core system. Always 0 in the current implementation.
      */
     function depositMarketUsd(
         uint128 marketId,
@@ -116,7 +114,7 @@ interface IMarketManagerModule {
      * @param marketId The id of the market from which snxUSD will be withdrawn.
      * @param target The address of the account that will receive the withdrawn snxUSD.
      * @param amount The amount of snxUSD to be withdraw, denominated with 18 decimals of precision.
-     * @return feeAmount the amount of fees paid (billed as additional debt towards liquidity providers)
+     * @return feeAmount Fee collected by the core system. Always 0 in the current implementation.
      */
     function withdrawMarketUsd(
         uint128 marketId,
@@ -128,8 +126,8 @@ interface IMarketManagerModule {
      * @notice Get the amount of fees paid in USD for a call to `depositMarketUsd` and `withdrawMarketUsd` for the given market and amount
      * @param marketId The market to check fees for
      * @param amount The amount deposited or withdrawn in USD
-     * @return depositFeeAmount the amount of USD paid for a call to `depositMarketUsd`
-     * @return withdrawFeeAmount the amount of USD paid for a call to `withdrawMarketUsd`
+     * @return depositFeeAmount the amount of USD paid for a call to `depositMarketUsd`, always 0
+     * @return withdrawFeeAmount the amount of USD paid for a call to `withdrawMarketUsd`, always 0
      */
     function getMarketFees(
         uint128 marketId,
@@ -248,10 +246,40 @@ interface IMarketManagerModule {
      */
     function getMinLiquidityRatio(uint128 marketId) external view returns (uint256 minRatioD18);
 
+    /**
+     * @notice Retrieves a list of pool ids supplying liquidity to the market. Additionally, returns a list of pool ids registered to the market, but not actively providing liquidity
+     * @param marketId the id of the market
+     */
     function getMarketPools(
         uint128 marketId
     ) external returns (uint128[] memory inRangePoolIds, uint128[] memory outRangePoolIds);
 
+    /**
+     * @notice Retrieves the maximum value per share tolerated by a pool before it will bumped out of the pool
+     */
+    function getMarketPoolMaxDebtPerShare(
+        uint128 marketId,
+        uint128 poolId
+    ) external view returns (int256);
+
+    /**
+     * @notice Retrieves the amount of credit capacity added to the total provided by a single pool attached the market
+     * @param marketId the id of the market
+     * @param poolId the id of the specific pool to retrieve capacity contribution for
+     */
+    function getMarketCapacityContributionFromPool(
+        uint128 marketId,
+        uint128 poolId
+    ) external view returns (uint256);
+
+    /**
+     * @notice Retrieves internal data about the debt distribution on the market
+     * @param marketId the id of the market
+     * @param poolId the id of the specific pool to retrieve sharesD18 for
+     * @return sharesD18 the number of shares (USD denominated) supplied by the supplied pool in the market
+     * @return totalSharesD18 the number of shares (USD denominated) supplied by all pools attached to the market
+     * @return valuePerShareD27 the current value per share of the debt distribution
+     */
     function getMarketPoolDebtDistribution(
         uint128 marketId,
         uint128 poolId

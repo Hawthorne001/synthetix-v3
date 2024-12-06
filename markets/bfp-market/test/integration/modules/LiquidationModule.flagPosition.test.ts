@@ -30,8 +30,6 @@ describe('LiquidationModule', () => {
 
   beforeEach(restore);
 
-  afterEach(async () => await setBaseFeePerGas(1, provider()));
-
   describe('flagPosition', () => {
     it('should flag a position with a health factor <= 1', async () => {
       const { BfpMarketProxy } = systems();
@@ -48,7 +46,7 @@ describe('LiquidationModule', () => {
 
       await commitAndSettle(bs, marketId, trader, order);
 
-      // Price falls/rises between 10% should results in a healthFactor of < 1.
+      // Price falls/rises between 10% should result in a healthFactor of < 1.
       //
       // Whether it goes up or down depends on the side of the order.
       const newMarketOraclePrice = wei(order.oraclePrice)
@@ -59,17 +57,17 @@ describe('LiquidationModule', () => {
       const { healthFactor } = await BfpMarketProxy.getPositionDigest(trader.accountId, marketId);
       assertBn.lte(healthFactor, bn(1));
 
-      // set base fee to 0 gwei to avoid rounding errors
-      await setBaseFeePerGas(0, provider());
-      const { flagKeeperReward } = await BfpMarketProxy.getLiquidationFees(
-        trader.accountId,
-        marketId
-      );
-
       const { receipt } = await withExplicitEvmMine(
         () => BfpMarketProxy.connect(keeper()).flagPosition(trader.accountId, marketId),
         provider()
       );
+      const blockNumber = receipt.blockNumber;
+      const { flagKeeperReward } = await BfpMarketProxy.getLiquidationFees(
+        trader.accountId,
+        marketId,
+        { blockTag: blockNumber }
+      );
+
       const keeperAddress = await keeper().getAddress();
       await assertEvent(
         receipt,
@@ -93,7 +91,7 @@ describe('LiquidationModule', () => {
 
       await commitAndSettle(bs, marketId, trader, order1);
 
-      // Price falls/rises between 10% should results in a healthFactor of < 1.
+      // Price falls/rises between 10% should result in a healthFactor of < 1.
       //
       // Whether it goes up or down depends on the side of the order.
       const newMarketOraclePrice = wei(order1.oraclePrice)
@@ -178,7 +176,7 @@ describe('LiquidationModule', () => {
 
       await commitAndSettle(bs, marketId, trader, order);
 
-      // Price falls/rises between 10% should results in a healthFactor of < 1.
+      // Price falls/rises between 10% should result in a healthFactor of < 1.
       //
       // Whether it goes up or down depends on the side of the order.
       const newMarketOraclePrice = wei(order.oraclePrice)
@@ -228,7 +226,7 @@ describe('LiquidationModule', () => {
 
       await commitAndSettle(bs, marketId, trader, order);
 
-      // Price falls/rises between 10% should results in a healthFactor of < 1.
+      // Price falls/rises between 10% should result in a healthFactor of < 1.
       //
       // Whether it goes up or down depends on the side of the order.
       const newMarketOraclePrice = wei(order.oraclePrice)
@@ -450,7 +448,7 @@ describe('LiquidationModule', () => {
     ]).it(
       'should emit all events in correct order (%s)',
       async (_, getCollateral: () => PerpCollateral) => {
-        const { BfpMarketProxy, Core, SpotMarket } = systems();
+        const { BfpMarketProxy, Core } = systems();
 
         const orderSide = genSide();
         const { trader, market, marketId, collateralDepositAmount, collateral } =
@@ -471,22 +469,21 @@ describe('LiquidationModule', () => {
         const { healthFactor } = await BfpMarketProxy.getPositionDigest(trader.accountId, marketId);
         assertBn.lte(healthFactor, bn(1));
 
-        // Set base fee to 0 gwei to avoid rounding errors
-        await setBaseFeePerGas(0, provider());
-
-        const { flagKeeperReward } = await BfpMarketProxy.getLiquidationFees(
-          trader.accountId,
-          marketId
-        );
         const { receipt } = await withExplicitEvmMine(
           () => BfpMarketProxy.connect(keeper()).flagPosition(trader.accountId, marketId),
           provider()
         );
 
+        const { flagKeeperReward } = await BfpMarketProxy.getLiquidationFees(
+          trader.accountId,
+          marketId,
+          { blockTag: receipt.blockNumber }
+        );
+
         const blockTime = (await provider().getBlock(receipt.blockNumber)).timestamp;
         const keeperAddress = await keeper().getAddress();
         const distributorAddress = collateral.rewardDistributorAddress();
-        const collateralAddress = collateral.synthAddress();
+        const collateralAddress = collateral.address();
         const poolCollateralAddress = pool().collateral().address;
         const poolId = pool().id;
 
@@ -518,16 +515,12 @@ describe('LiquidationModule', () => {
           ];
         }
 
-        // Create a contract that can parse all events emitted.
-        //
-        // This isn't necessary for sUSD collateral but it doesn't affect the correctness of this test.
-        const spotMarketEvents = SpotMarket.interface.format(utils.FormatTypes.full);
         const coreEvents = Core.interface.format(utils.FormatTypes.full) as string[];
         const contractsWithAllEvents = extendContractAbi(
           BfpMarketProxy,
-          coreEvents
-            .concat(spotMarketEvents)
-            .concat(['event Transfer(address indexed from, address indexed to, uint256 value)'])
+          coreEvents.concat([
+            'event Transfer(address indexed from, address indexed to, uint256 value)',
+          ])
         );
         await assertEvents(receipt, expectedEvents, contractsWithAllEvents);
       }

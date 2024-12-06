@@ -13,26 +13,27 @@ import assertBn from '@synthetixio/core-utils/utils/assertions/assert-bignumber'
 import { deepEqual } from 'assert';
 
 describe('Cancel Offchain Async Order test', () => {
-  const { systems, perpsMarkets, synthMarkets, provider, trader1, keeper } = bootstrapMarkets({
-    synthMarkets: [
-      {
-        name: 'Bitcoin',
-        token: 'snxBTC',
-        buyPrice: bn(10_000),
-        sellPrice: bn(10_000),
-      },
-    ],
-    perpsMarkets: [
-      {
-        requestedMarketId: 25,
-        name: 'Ether',
-        token: 'snxETH',
-        price: bn(1000),
-        fundingParams: { skewScale: bn(100_000), maxFundingVelocity: bn(10) },
-      },
-    ],
-    traderAccountIds: [2, 3],
-  });
+  const { systems, perpsMarkets, synthMarkets, provider, owner, trader1, keeper } =
+    bootstrapMarkets({
+      synthMarkets: [
+        {
+          name: 'Bitcoin',
+          token: 'snxBTC',
+          buyPrice: bn(10_000),
+          sellPrice: bn(10_000),
+        },
+      ],
+      perpsMarkets: [
+        {
+          requestedMarketId: 25,
+          name: 'Ether',
+          token: 'snxETH',
+          price: bn(1000),
+          fundingParams: { skewScale: bn(100_000), maxFundingVelocity: bn(10) },
+        },
+      ],
+      traderAccountIds: [2, 3],
+    });
   let ethMarketId: ethers.BigNumber;
   let ethSettlementStrategyId: ethers.BigNumber;
   let btcSynth: SynthMarkets[number];
@@ -191,7 +192,7 @@ describe('Cancel Offchain Async Order test', () => {
 
           await assertRevert(
             systems().PerpsMarket.connect(keeper()).cancelOrder(2),
-            `PriceNotExceeded("${bn(1000.005)}", "${bn(1050)}")`
+            `AcceptablePriceNotExceeded("${bn(1000.005)}", "${bn(1050)}")`
           );
         });
       });
@@ -236,9 +237,15 @@ describe('Cancel Offchain Async Order test', () => {
           let cancelTx: ethers.ContractTransaction;
           let accountBalanceBefore: ethers.BigNumber;
           let keeperBalanceBefore: ethers.BigNumber;
+          let expectedDebt: ethers.BigNumber;
           const settlementReward = DEFAULT_SETTLEMENT_STRATEGY.settlementReward;
 
           before('collect initial balances', async () => {
+            // if snxUSD available, subtract settlementReward from snxUSD otherwise add to debt
+            const startingSnxUSDBalance = await systems().PerpsMarket.getCollateralAmount(2, 0);
+            const leftoverSnxUsd = startingSnxUSDBalance.sub(settlementReward);
+            expectedDebt = leftoverSnxUsd.lt(0) ? leftoverSnxUsd.abs() : wei(0).toBN();
+
             accountBalanceBefore = await systems().PerpsMarket.getAvailableMargin(2);
             keeperBalanceBefore = await systems().USD.balanceOf(await keeper().getAddress());
           });
@@ -275,29 +282,13 @@ describe('Cancel Offchain Async Order test', () => {
             );
           });
 
-          it('emits collateral deducted events', async () => {
-            let pendingSettlementRewards = settlementReward;
-            const accountId = 2;
-
-            for (let i = 0; i < testCase.collateralData.collaterals.length; i++) {
-              const collateral = testCase.collateralData.collaterals[i];
-              const synthMarket = collateral.synthMarket ? collateral.synthMarket().marketId() : 0;
-              let deductedCollateralAmount: ethers.BigNumber = bn(0);
-              if (synthMarket == 0) {
-                deductedCollateralAmount = collateral.snxUSDAmount().lt(pendingSettlementRewards)
-                  ? collateral.snxUSDAmount()
-                  : pendingSettlementRewards;
-              } else {
-                deductedCollateralAmount = pendingSettlementRewards.div(10_000);
-              }
-              pendingSettlementRewards = pendingSettlementRewards.sub(deductedCollateralAmount);
-
-              await assertEvent(
-                cancelTx,
-                `CollateralDeducted(${accountId}, ${synthMarket}, ${deductedCollateralAmount})`,
-                systems().PerpsMarket
-              );
-            }
+          it('emits AccountCharged event', async () => {
+            const params = [2, settlementReward, expectedDebt];
+            await assertEvent(
+              cancelTx,
+              `AccountCharged(${params.join(', ')})`,
+              systems().PerpsMarket
+            );
           });
 
           it('updates balances accordingly', async () => {
@@ -305,6 +296,8 @@ describe('Cancel Offchain Async Order test', () => {
             const keeperBalanceAfter = await systems().USD.balanceOf(await keeper().getAddress());
             assertBn.equal(keeperBalanceAfter, keeperBalanceBefore.add(settlementReward));
             assertBn.equal(accountBalanceAfter, accountBalanceBefore.sub(settlementReward));
+
+            assertBn.equal(await systems().PerpsMarket.debt(2), expectedDebt);
           });
 
           it('check account open position market ids', async () => {
@@ -315,4 +308,50 @@ describe('Cancel Offchain Async Order test', () => {
       });
     });
   }
+
+  describe('cancel order due to market insolvency', () => {
+    let tx: ethers.ContractTransaction;
+    let startTime: number;
+
+    before(restoreToCommit);
+
+    before('commit the order and prepare for cancellation', async () => {
+      await depositCollateral(testCases[0].collateralData);
+
+      tx = await systems()
+        .PerpsMarket.connect(trader1())
+        .commitOrder({
+          marketId: ethMarketId,
+          accountId: 2,
+          sizeDelta: bn(1),
+          settlementStrategyId: 0,
+          acceptablePrice: bn(1050), // 5% slippage
+          referrer: ethers.constants.AddressZero,
+          trackingCode: ethers.constants.HashZero,
+        });
+      startTime = await getTxTime(provider(), tx);
+
+      // fast forward to settlement
+      await fastForwardTo(startTime + DEFAULT_SETTLEMENT_STRATEGY.settlementDelay + 1, provider());
+
+      await systems().MockPythERC7412Wrapper.setBenchmarkPrice(bn(1000));
+    });
+
+    it('reverts if trying to cancel an order when market is solvent', async () => {
+      await assertRevert(
+        systems().PerpsMarket.connect(keeper()).cancelOrder(2),
+        `AcceptablePriceNotExceeded("${bn(1000.005)}", "${bn(1050)}")`
+      );
+    });
+
+    it('allows to cancel an order if the market is insolvent', async () => {
+      // First set the locked OI ratio to something super high
+      const highLockedOiPercentRatioD18 = bn(100 * 1e18);
+      await systems()
+        .PerpsMarket.connect(owner())
+        .setLockedOiRatio(ethMarketId, highLockedOiPercentRatioD18);
+
+      await systems().PerpsMarket.connect(keeper()).cancelOrder(2);
+    });
+  });
 });
