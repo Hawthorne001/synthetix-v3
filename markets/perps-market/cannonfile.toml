@@ -54,6 +54,9 @@ artifact = "PerpsMarketModule"
 [contract.LiquidationModule]
 artifact = "LiquidationModule"
 
+[contract.CollateralConfigurationModule]
+artifact = "CollateralConfigurationModule"
+
 [contract.MarketConfigurationModule]
 artifact = "MarketConfigurationModule"
 
@@ -87,6 +90,7 @@ contracts = [
     "FeatureFlagModule",
     "LiquidationModule",
     "MarketConfigurationModule",
+    "CollateralConfigurationModule",
     "GlobalPerpsMarketModule",
 ]
 
@@ -96,6 +100,7 @@ fromCall.func = "owner"
 func = "upgradeTo"
 args = ["<%= contracts.PerpsMarketRouter.address %>"]
 factory.PerpsMarketProxy.abiOf = ["PerpsMarketRouter"]
+factory.PerpsMarketProxy.artifact = "contracts/Proxy.sol:Proxy"
 factory.PerpsMarketProxy.event = "Upgraded"
 factory.PerpsMarketProxy.arg = 0
 factory.PerpsMarketProxy.highlight = true

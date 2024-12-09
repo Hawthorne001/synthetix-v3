@@ -177,11 +177,11 @@ describe('LiquidationModule', () => {
 
         const { trader, remainingSize, marketId } = await configurePartiallyLiquidatedPosition();
 
-        // Should be fullt exhausted.
+        // Should be fully exhausted.
         const cap1 = await BfpMarketProxy.getRemainingLiquidatableSizeCapacity(marketId);
         assertBn.isZero(cap1.remainingCapacity);
 
-        // Endorsed liqudaitor to liquidate remaining capacity.
+        // Endorsed liquidator to liquidate remaining capacity.
         const d1 = await BfpMarketProxy.getAccountDigest(trader.accountId, marketId);
         assertBn.equal(d1.position.size, remainingSize);
 
@@ -605,22 +605,10 @@ describe('LiquidationModule', () => {
         const marketOraclePrice2 = wei(marketOraclePrice1).mul(0.9).toBN();
         await market.aggregator().mockSetCurrentPrice(marketOraclePrice2);
 
-        const baseFeePerGas = await setBaseFeePerGas(0, provider());
-
         const { liqKeeperFee } = await BfpMarketProxy.getLiquidationFees(
           trader.accountId,
           marketId
         );
-
-        const { answer: ethPrice } = await bs.ethOracleNode().agg.latestRoundData();
-        const expectedLiqFee = calcLiquidationKeeperFee(
-          ethPrice,
-          baseFeePerGas,
-          wei(order.sizeDelta).abs(),
-          wei(capBefore.maxLiquidatableCapacity),
-          globalConfig
-        );
-        assertBn.equal(expectedLiqFee.toBN(), liqKeeperFee);
 
         // Dead.
         await withExplicitEvmMine(
@@ -630,7 +618,7 @@ describe('LiquidationModule', () => {
             }),
           provider()
         );
-
+        let lastBlockNumber = (await provider().getBlock('latest')).number;
         let accLiqRewards = bn(0);
         let remainingSize = bn(-1);
 
@@ -643,6 +631,7 @@ describe('LiquidationModule', () => {
               }),
             provider()
           );
+
           const { liqKeeperFee, remainingSize: _remSize } = findEventSafe(
             receipt,
             'PositionLiquidated',
@@ -651,9 +640,20 @@ describe('LiquidationModule', () => {
 
           accLiqRewards = accLiqRewards.add(liqKeeperFee);
           remainingSize = _remSize;
+          lastBlockNumber = receipt.blockNumber;
         }
+        const baseFeePerGas = (await provider().getBlock(lastBlockNumber)).baseFeePerGas ?? bn(0);
+        const { answer: ethPrice } = await bs.ethOracleNode().agg.latestRoundData();
+        const expectedLiqFee = calcLiquidationKeeperFee(
+          ethPrice,
+          baseFeePerGas,
+          wei(order.sizeDelta).abs(),
+          wei(capBefore.maxLiquidatableCapacity),
+          globalConfig
+        );
+        assertBn.near(expectedLiqFee.toBN(), liqKeeperFee, bn(1));
         // `sum(liqReward)` should equal to liqReward from the prior step.
-        assertBn.equal(accLiqRewards, expectedLiqFee.toBN());
+        assertBn.near(accLiqRewards, expectedLiqFee.toBN(), bn(1));
       });
 
       it('should cap liqKeeperFee and flagKeeperReward to the maxKeeperFee', async () => {
@@ -676,7 +676,7 @@ describe('LiquidationModule', () => {
 
         await commitAndSettle(bs, marketId, trader, order);
 
-        // Price falls/rises between 10% should results in a healthFactor of < 1.
+        // Price falls/rises between 10% should result in a healthFactor of < 1.
         // Whether it goes up or down depends on the side of the order.
         const newMarketOraclePrice = wei(order.oraclePrice)
           .mul(orderSide === 1 ? 0.9 : 1.1)
@@ -722,7 +722,7 @@ describe('LiquidationModule', () => {
 
         await commitAndSettle(bs, marketId, trader, order);
 
-        // Price falls/rises between 10% should results in a healthFactor of < 1.
+        // Price falls/rises between 10% should result in a healthFactor of < 1.
         // Whether it goes up or down depends on the side of the order.
         const newMarketOraclePrice = wei(order.oraclePrice)
           .mul(orderSide === 1 ? 0.9 : 1.1)
@@ -732,7 +732,7 @@ describe('LiquidationModule', () => {
         const { liquidationRewardPercent: flagRewardPercent } = await setMarketConfigurationById(
           bs,
           marketId,
-          { liquidationRewardPercent: bn(0.0001) } // really small so we dont hit maxKeeperFeeUsd
+          { liquidationRewardPercent: bn(0.0001) } // really small so we don't hit maxKeeperFeeUsd
         );
         const { keeperProfitMarginPercent, keeperLiquidationGasUnits, keeperFlagGasUnits } =
           await setMarketConfiguration(bs, {
@@ -740,6 +740,7 @@ describe('LiquidationModule', () => {
             keeperProfitMarginUsd: bn(0), // ensure keeperProfitMarginPercent would be used instead
             keeperLiquidationGasUnits: 500_000,
             keeperFlagGasUnits: 500_000,
+            minKeeperFeeUsd: bn(0),
           });
 
         // Set baseFeePerGas to 1gwei
@@ -807,7 +808,7 @@ describe('LiquidationModule', () => {
         });
 
         await commitAndSettle(bs, marketId, trader, order);
-        // Price falls/rises between 10% should results in a healthFactor of < 1.
+        // Price falls/rises between 10% should result in a healthFactor of < 1.
         // Whether it goes up or down depends on the side of the order.
         const newMarketOraclePrice = wei(order.oraclePrice)
           .mul(orderSide === 1 ? 0.9 : 1.1)
@@ -816,7 +817,7 @@ describe('LiquidationModule', () => {
         const { liquidationRewardPercent: flagRewardPercent } = await setMarketConfigurationById(
           bs,
           marketId,
-          { liquidationRewardPercent: bn(0.0001) } // really small so we dont hit maxKeeperFeeUsd
+          { liquidationRewardPercent: bn(0.0001) } // really small so we don't hit maxKeeperFeeUsd
         );
         const { keeperProfitMarginUsd, keeperLiquidationGasUnits, keeperFlagGasUnits } =
           await setMarketConfiguration(bs, {
@@ -944,7 +945,7 @@ describe('LiquidationModule', () => {
         const tradersToUse = traders().slice(0, 2);
 
         for (const trader of tradersToUse) {
-          const marginUsdDepositAmount = genOneOf([1000, 5000, 10_000]);
+          const marginUsdDepositAmount = genOneOf([2000, 5000, 10_000]);
           const collateral = genOneOf(collaterals());
 
           const { collateralDepositAmount: collateralDepositAmount1 } = await depositMargin(

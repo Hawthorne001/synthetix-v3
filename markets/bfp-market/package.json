@@ -1,14 +1,27 @@
 {
   "name": "@synthetixio/bfp-market",
-  "version": "1.0.0-alpha.1",
+  "version": "3.10.1",
   "description": "L1 perp market implementation",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "contracts",
+    "!contracts/generated",
+    "hardhat.config.ts",
+    "storage.dump.json",
+    "*.toml"
+  ],
   "scripts": {
     "build": "yarn build:contracts",
-    "build:contracts": "hardhat compile --force && hardhat storage:verify && CANNON_REGISTRY_PRIORITY=local hardhat cannon:build",
+    "build:contracts": "hardhat compile --force && yarn storage:dump && CANNON_REGISTRY_PRIORITY=local hardhat cannon:build",
+    "storage:dump": "hardhat storage:dump --output storage.new.dump.json",
+    "storage:verify": " hardhat storage:verify",
+    "SKIP.generate-testable": "rm -rf contracts/generated && hardhat generate-testable",
     "build-testable": "CANNON_REGISTRY_PRIORITY=local hardhat cannon:build cannonfile.test.toml",
-    "check:storage": "git diff --exit-code storage.dump.sol",
+    "check:storage": "diff -uw storage.dump.json storage.new.dump.json",
     "start": "yarn build && yarn cannon-build",
-    "clean": "hardhat clean",
+    "clean": "hardhat clean && rm -rf contracts/generated",
     "cannon-build": "hardhat cannon:build",
     "test": "CANNON_REGISTRY_PRIORITY=local hardhat test",
     "test:stable": "sh ./scripts/stable_test.sh",
@@ -23,27 +36,22 @@
   "author": "Synthetix",
   "license": "MIT",
   "devDependencies": {
-    "@ethersproject/abi": "^5.7.0",
-    "@ethersproject/providers": "^5.7.2",
     "@openzeppelin/contracts": "4.9.3",
     "@synthetixio/common-config": "workspace:*",
     "@synthetixio/core-utils": "workspace:*",
     "@synthetixio/docgen": "workspace:*",
     "@synthetixio/main": "workspace:*",
     "@synthetixio/oracle-manager": "workspace:*",
-    "@synthetixio/router": "3.3.7",
-    "@synthetixio/spot-market": "workspace:*",
     "@synthetixio/wei": "^2.74.4",
     "@types/lodash": "^4.14.199",
-    "@types/mocha-each": "2.0.1",
-    "@usecannon/cli": "2.12.2",
+    "@types/mocha-each": "^2.0.1",
+    "@usecannon/cli": "2.20.1",
     "ethers": "^5.7.2",
     "hardhat": "^2.19.5",
     "lodash": "^4.17.21",
-    "mocha-each": "2.0.1",
+    "mocha-each": "^2.0.1",
     "solidity-docgen": "^0.6.0-beta.36",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.3.3"
+    "typescript": "^5.5.4"
   },
   "depcheck": {
     "ignoreMatches": [

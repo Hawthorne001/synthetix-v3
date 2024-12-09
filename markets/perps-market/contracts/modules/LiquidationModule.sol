@@ -19,6 +19,7 @@ import {GlobalPerpsMarket} from "../storage/GlobalPerpsMarket.sol";
 import {MarketUpdate} from "../storage/MarketUpdate.sol";
 import {IMarketEvents} from "../interfaces/IMarketEvents.sol";
 import {KeeperCosts} from "../storage/KeeperCosts.sol";
+import {AsyncOrder} from "../storage/AsyncOrder.sol";
 
 /**
  * @title Module for liquidating accounts.
@@ -34,6 +35,7 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
     using PerpsMarket for PerpsMarket.Data;
     using GlobalPerpsMarketConfiguration for GlobalPerpsMarketConfiguration.Data;
     using KeeperCosts for KeeperCosts.Data;
+    using AsyncOrder for AsyncOrder.Data;
 
     /**
      * @inheritdoc ILiquidationModule
@@ -55,7 +57,7 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
             ) = account.isEligibleForLiquidation(PerpsPrice.Tolerance.STRICT);
 
             if (isEligible) {
-                (uint256 flagCost, uint256 marginCollected) = account.flagForLiquidation();
+                (uint256 flagCost, uint256 seizedMarginValue) = account.flagForLiquidation();
 
                 emit AccountFlaggedForLiquidation(
                     accountId,
@@ -65,12 +67,48 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
                     flagCost
                 );
 
-                liquidationReward = _liquidateAccount(account, flagCost, marginCollected, true);
+                liquidationReward = _liquidateAccount(account, flagCost, seizedMarginValue, true);
             } else {
                 revert NotEligibleForLiquidation(accountId);
             }
         } else {
             liquidationReward = _liquidateAccount(account, 0, 0, false);
+        }
+    }
+
+    function liquidateMarginOnly(
+        uint128 accountId
+    ) external override returns (uint256 liquidationReward) {
+        FeatureFlag.ensureAccessToFeature(Flags.PERPS_SYSTEM);
+
+        PerpsAccount.Data storage account = PerpsAccount.load(accountId);
+
+        if (account.hasOpenPositions()) {
+            revert AccountHasOpenPositions(accountId);
+        }
+
+        (bool isEligible, ) = account.isEligibleForMarginLiquidation(PerpsPrice.Tolerance.STRICT);
+        if (isEligible) {
+            // margin is sent to liquidation rewards distributor in getMarginLiquidationCostAndSeizeMargin
+            uint256 marginLiquidateCost = KeeperCosts.load().getFlagKeeperCosts(account.id);
+            uint256 seizedMarginValue = account.seizeCollateral();
+
+            // keeper is rewarded in _liquidateAccount
+            liquidationReward = _liquidateAccount(
+                account,
+                marginLiquidateCost,
+                seizedMarginValue,
+                true
+            );
+            // clear debt
+            account.updateAccountDebt(-(account.debt.toInt()));
+
+            // clean pending orders
+            AsyncOrder.load(accountId).reset();
+
+            emit AccountMarginLiquidation(accountId, seizedMarginValue, liquidationReward);
+        } else {
+            revert NotEligibleForMarginLiquidation(accountId);
         }
     }
 
@@ -131,9 +169,25 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
      * @inheritdoc ILiquidationModule
      */
     function canLiquidate(uint128 accountId) external view override returns (bool isEligible) {
+        // If an account is already flagged can be liquidated, no matter other conditions
+        if (GlobalPerpsMarket.load().liquidatableAccounts.contains(accountId)) {
+            return true;
+        }
+
         (isEligible, , , , ) = PerpsAccount.load(accountId).isEligibleForLiquidation(
             PerpsPrice.Tolerance.DEFAULT
         );
+    }
+
+    function canLiquidateMarginOnly(
+        uint128 accountId
+    ) external view override returns (bool isEligible) {
+        PerpsAccount.Data storage account = PerpsAccount.load(accountId);
+        if (account.hasOpenPositions()) {
+            return false;
+        } else {
+            (isEligible, ) = account.isEligibleForMarginLiquidation(PerpsPrice.Tolerance.DEFAULT);
+        }
     }
 
     /**
@@ -180,6 +234,10 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
         LiquidateAccountRuntime memory runtime;
         runtime.accountId = account.id;
         uint256[] memory openPositionMarketIds = account.openPositionMarketIds.values();
+        uint256[] memory prices = PerpsPrice.getCurrentPrices(
+            openPositionMarketIds,
+            PerpsPrice.Tolerance.STRICT
+        );
 
         for (
             runtime.loopIterator = 0;
@@ -187,10 +245,7 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
             runtime.loopIterator++
         ) {
             runtime.positionMarketId = openPositionMarketIds[runtime.loopIterator].to128();
-            runtime.price = PerpsPrice.getCurrentPrice(
-                runtime.positionMarketId,
-                PerpsPrice.Tolerance.STRICT
-            );
+            runtime.price = prices[runtime.loopIterator];
 
             (
                 uint256 amountLiquidated,
@@ -236,6 +291,21 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
             );
         }
 
+        if (
+            ERC2771Context._msgSender() !=
+            PerpsMarketConfiguration.load(runtime.positionMarketId).endorsedLiquidator
+        ) {
+            // Use max of collateral or positions flag rewards
+            uint256 totalCollateralLiquidateRewards = GlobalPerpsMarketConfiguration
+                .load()
+                .calculateCollateralLiquidateReward(totalCollateralValue);
+
+            runtime.totalFlaggingRewards = MathUtil.max(
+                totalCollateralLiquidateRewards,
+                runtime.totalFlaggingRewards
+            );
+        }
+
         runtime.totalLiquidationCost =
             KeeperCosts.load().getLiquidateKeeperCosts() +
             costOfFlagExecution;
@@ -246,7 +316,10 @@ contract LiquidationModule is ILiquidationModule, IMarketEvents {
                 totalCollateralValue
             );
             runtime.accountFullyLiquidated = account.openPositionMarketIds.length() == 0;
-            if (runtime.accountFullyLiquidated) {
+            if (
+                runtime.accountFullyLiquidated &&
+                GlobalPerpsMarket.load().liquidatableAccounts.contains(runtime.accountId)
+            ) {
                 GlobalPerpsMarket.load().liquidatableAccounts.remove(runtime.accountId);
             }
         }

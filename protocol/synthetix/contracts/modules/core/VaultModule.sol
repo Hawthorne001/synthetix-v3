@@ -65,12 +65,6 @@ contract VaultModule is IVaultModule {
         // Identify the vault that corresponds to this collateral type and pool id.
         Vault.Data storage vault = Pool.loadExisting(poolId).vaults[collateralType];
 
-        // Use account interaction to update its rewards.
-        uint256 totalSharesD18 = vault.currentEpoch().accountsDebtDistribution.totalSharesD18;
-        uint256 actorSharesD18 = vault.currentEpoch().accountsDebtDistribution.getActorShares(
-            accountId.toBytes32()
-        );
-
         uint256 currentCollateralAmount = vault.currentAccountCollateral(accountId);
 
         // Conditions for collateral amount
@@ -97,9 +91,15 @@ contract VaultModule is IVaultModule {
             // if decreasing delegation amount, ensure min time has elapsed
         } else {
             Pool.loadExisting(poolId).requireMinDelegationTimeElapsed(
+                accountId,
                 vault.currentEpoch().lastDelegationTime[accountId]
             );
         }
+
+        // distribute any outstanding rewards distributor value to vaults prior to updating positions
+        Pool.load(poolId).updateRewardsToVaults(
+            Vault.PositionSelector(accountId, poolId, collateralType)
+        );
 
         // Update the account's position for the given pool and collateral type,
         // Note: This will trigger an update in the entire debt distribution chain.
@@ -111,6 +111,8 @@ contract VaultModule is IVaultModule {
             currentCollateralAmount,
             leverage
         );
+
+        _verifyPoolCratio(poolId, collateralType);
 
         _updateAccountCollateralPools(
             accountId,
@@ -133,7 +135,7 @@ contract VaultModule is IVaultModule {
             // Minimum collateralization ratios are configured in the system per collateral type.abi
             // Ensure that the account's updated position satisfies this requirement.
             CollateralConfiguration.load(collateralType).verifyIssuanceRatio(
-                debt < 0 ? 0 : debt.toUint(),
+                debt,
                 newCollateralAmountD18.mulDecimal(collateralPrice),
                 minIssuanceRatioD18
             );
@@ -153,12 +155,6 @@ contract VaultModule is IVaultModule {
             newCollateralAmountD18,
             leverage,
             ERC2771Context._msgSender()
-        );
-
-        vault.updateRewards(
-            Vault.PositionSelector(accountId, poolId, collateralType),
-            totalSharesD18,
-            actorSharesD18
         );
     }
 
@@ -306,6 +302,19 @@ contract VaultModule is IVaultModule {
 
         if (market.id > 0) {
             revert CapacityLocked(market.id);
+        }
+    }
+
+    function _verifyPoolCratio(uint128 poolId, address collateralType) internal {
+        Pool.Data storage pool = Pool.load(poolId);
+        int256 rawVaultDebt = pool.currentVaultDebt(collateralType);
+        (, uint256 collateralValue) = pool.currentVaultCollateral(collateralType);
+        if (
+            rawVaultDebt > 0 &&
+            collateralValue.divDecimal(rawVaultDebt.toUint()) <
+            CollateralConfiguration.load(collateralType).liquidationRatioD18
+        ) {
+            revert InsufficientVaultCollateralRatio(poolId, collateralType);
         }
     }
 
