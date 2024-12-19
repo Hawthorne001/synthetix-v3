@@ -41,7 +41,12 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
 
     IAddressResolver public v2xResolver;
     IV3CoreProxy public v3System;
+
+    // NOTE: below field is now unused but we leave it here to reduce maintenance burden
     ISNXDistributor public rewardsDistributor;
+
+    // in case an account nft was not able to be transferred to a owner's address due to some error, we allow transferring it later using this structure.
+    mapping(uint256 => address) deferredAccounts;
 
     error MigrationInProgress();
 
@@ -55,6 +60,7 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
     error NothingToMigrate();
     error InsufficientCollateralMigrated(uint256 amountRequested, uint256 amountAvailable);
     error Paused();
+    error V2xPaused();
 
     // solhint-disable-next-line no-empty-blocks
     constructor() Ownable(ERC2771Context._msgSender()) {}
@@ -156,8 +162,11 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
         // now burn it
         uint256 beforeDebt = iss.debtBalanceOf(address(this), "sUSD");
         oldSynthetix.burnSynths(amount);
-        if (iss.debtBalanceOf(address(this), "sUSD") != beforeDebt - amount) {
-            revert Paused();
+        uint256 afterDebt = iss.debtBalanceOf(address(this), "sUSD");
+
+        // approximately equal check because some rounding error can happen on the v2x side
+        if (beforeDebt - afterDebt == 0 || beforeDebt - afterDebt < amount - 100) {
+            revert V2xPaused();
         }
 
         // now mint same amount of snxUSD (called a "withdraw" in v3 land)
@@ -180,7 +189,11 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
     /**
      * @inheritdoc ILegacyMarket
      */
-    function migrateOnBehalf(address staker, uint128 accountId) external onlyOwner {
+    function migrateOnBehalf(address staker, uint128 accountId) external {
+        if (staker == ERC2771Context._msgSender() && pauseMigration) {
+            revert Paused();
+        }
+
         _migrate(staker, accountId);
     }
 
@@ -218,24 +231,13 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
         uint256 cratio = (collateralMigrated * v3System.getCollateralPrice(address(oldSynthetix))) /
             debtValueMigrated;
 
-        // if the account needs to be liquidated, liquidate it here by unlocking the debt to all accounts and moving to a
+        // if not the owner and the account is not liquidatable, fail
         if (
-            cratio < v3System.getCollateralConfiguration(address(oldSynthetix)).liquidationRatioD18
+            ERC2771Context._msgSender() != staker &&
+            ERC2771Context._msgSender() != OwnableStorage.load().owner &&
+            cratio >= v3System.getCollateralConfiguration(address(oldSynthetix)).liquidationRatioD18
         ) {
-            oldSynthetix.transfer(address(rewardsDistributor), collateralMigrated);
-            rewardsDistributor.notifyRewardAmount(collateralMigrated);
-
-            tmpLockedDebt = 0;
-            migrationInProgress = false;
-
-            emit AccountLiquidatedInMigration(
-                staker,
-                collateralMigrated,
-                debtValueMigrated,
-                cratio
-            );
-
-            return;
+            revert AccessError.Unauthorized(ERC2771Context._msgSender());
         }
 
         // start building the staker's v3 account
@@ -247,7 +249,7 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
         // create the most-equivalent mechanism for v3 to match the vesting entries: a "lock"
         uint256 curTime = block.timestamp;
         for (uint256 i = 0; i < oldEscrows.length; i++) {
-            if (oldEscrows[i].endTime > curTime) {
+            if (oldEscrows[i].endTime > curTime && oldEscrows[i].escrowAmount > 0) {
                 v3System.createLock(
                     accountId,
                     address(oldSynthetix),
@@ -282,14 +284,36 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
             debtValueMigrated
         );
 
+        if (v3System.isVaultLiquidatable(preferredPoolId, address(oldSynthetix))) {
+            revert Paused();
+        }
+
         // send the built v3 account to the staker
-        IERC721(v3System.getAccountTokenAddress()).safeTransferFrom(
-            address(this),
-            staker,
-            accountId
-        );
+        try
+            IERC721(v3System.getAccountTokenAddress()).safeTransferFrom(
+                address(this),
+                staker,
+                accountId
+            )
+        {} catch {
+            deferredAccounts[accountId] = staker;
+        }
 
         emit AccountMigrated(staker, accountId, collateralMigrated, debtValueMigrated);
+    }
+
+    /**
+     * @dev In case a previously migrated account was not able to be sent to a user during the migration, this function can be
+     * called in order to claim the token afterwards to any address.
+     */
+    function transferDeferredAccount(uint256 accountId, address to) external {
+        if (deferredAccounts[accountId] != ERC2771Context._msgSender()) {
+            revert AccessError.Unauthorized(ERC2771Context._msgSender());
+        }
+
+        deferredAccounts[accountId] = address(0);
+
+        IERC721(v3System.getAccountTokenAddress()).safeTransferFrom(address(this), to, accountId);
     }
 
     /**
@@ -348,9 +372,17 @@ contract LegacyMarket is ILegacyMarket, Ownable, UUPSImplementation, IMarket, IE
     function _calculateDebtValueMigrated(
         uint256 debtSharesMigrated
     ) internal view returns (uint256 portionMigrated) {
-        (uint256 totalSystemDebt, uint256 totalDebtShares, ) = IIssuer(
+        (uint256 totalSystemDebt, uint256 totalDebtShares, bool isStale) = IIssuer(
             v2xResolver.getAddress("Issuer")
         ).allNetworksDebtInfo();
+
+        if (isStale) {
+            revert V2xPaused();
+        }
+
+        if (totalDebtShares == 0) {
+            return 0;
+        }
 
         return (debtSharesMigrated * totalSystemDebt) / totalDebtShares;
     }

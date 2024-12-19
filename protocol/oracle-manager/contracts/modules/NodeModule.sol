@@ -16,6 +16,7 @@ import "../storage/NodeOutput.sol";
 import "../storage/NodeDefinition.sol";
 
 import "@synthetixio/core-contracts/contracts/errors/ParameterError.sol";
+import "@synthetixio/core-contracts/contracts/utils/RevertUtil.sol";
 
 /**
  * @title Module for managing nodes
@@ -67,7 +68,12 @@ contract NodeModule is INodeModule {
      * @inheritdoc INodeModule
      */
     function process(bytes32 nodeId) external view returns (NodeOutput.Data memory node) {
-        return NodeDefinition.process(nodeId, new bytes32[](0), new bytes32[](0));
+        bytes memory err;
+        (node, err) = NodeDefinition.process(nodeId, new bytes32[](0), new bytes32[](0));
+
+        if (err.length > 0) {
+            RevertUtil.revertWithReason(err);
+        }
     }
 
     /**
@@ -78,7 +84,69 @@ contract NodeModule is INodeModule {
         bytes32[] memory runtimeKeys,
         bytes32[] memory runtimeValues
     ) external view returns (NodeOutput.Data memory node) {
-        return NodeDefinition.process(nodeId, runtimeKeys, runtimeValues);
+        bytes memory err;
+        (node, err) = NodeDefinition.process(nodeId, runtimeKeys, runtimeValues);
+
+        RevertUtil.revertIfError(err);
+    }
+
+    function processManyWithRuntime(
+        bytes32[] memory nodeIds,
+        bytes32[] memory runtimeKeys,
+        bytes32[] memory runtimeValues
+    ) external view returns (NodeOutput.Data[] memory nodes) {
+        nodes = new NodeOutput.Data[](nodeIds.length);
+        bytes[] memory errors = new bytes[](nodeIds.length);
+        uint256 errIdx = 0;
+
+        for (uint256 i = 0; i < nodeIds.length; i++) {
+            (nodes[i], errors[errIdx]) = NodeDefinition.process(
+                nodeIds[i],
+                runtimeKeys,
+                runtimeValues
+            );
+
+            if (errors[errIdx].length > 0) {
+                errIdx++;
+            }
+        }
+
+        if (errIdx > 0) {
+            // have to shorten the length of the memory array (can only do so by creating a new one with the new length and copying over)
+            bytes[] memory copiedErrors = new bytes[](errIdx);
+            for (uint256 i = 0; i < errIdx; i++) {
+                copiedErrors[i] = errors[i];
+            }
+            revert Errors(copiedErrors);
+        }
+    }
+    function processManyWithManyRuntime(
+        bytes32[] memory nodeIds,
+        bytes32[][] memory runtimeKeys,
+        bytes32[][] memory runtimeValues
+    ) external view returns (NodeOutput.Data[] memory nodes) {
+        if (nodeIds.length != runtimeKeys.length) {
+            revert ParameterError.InvalidParameter("runtimeKeys", "must be same length as nodeIds");
+        }
+        if (nodeIds.length != runtimeValues.length) {
+            revert ParameterError.InvalidParameter(
+                "runtimeValues",
+                "must be same length as nodeIds"
+            );
+        }
+
+        nodes = new NodeOutput.Data[](nodeIds.length);
+        bytes[] memory possibleErrors = new bytes[](nodeIds.length);
+
+        for (uint256 i = 0; i < nodeIds.length; i++) {
+            (nodes[i], possibleErrors[i]) = NodeDefinition.process(
+                nodeIds[i],
+                runtimeKeys[i],
+                runtimeValues[i]
+            );
+        }
+
+        RevertUtil.revertManyIfError(possibleErrors);
     }
 
     /**

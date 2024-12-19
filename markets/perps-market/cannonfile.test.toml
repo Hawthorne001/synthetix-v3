@@ -10,6 +10,9 @@ defaultValue = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 description = "perps market owner"
 defaultValue = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
 
+[setting.salt]
+defaultValue = ""
+
 [setting.synthetixPackage]
 defaultValue = "synthetix:<%= package.version %>-testable"
 depends = []
@@ -45,6 +48,9 @@ artifact = "PerpsMarketModule"
 [contract.LiquidationModule]
 artifact = "LiquidationModule"
 
+[contract.CollateralConfigurationModule]
+artifact = "CollateralConfigurationModule"
+
 [contract.MarketConfigurationModule]
 artifact = "MarketConfigurationModule"
 
@@ -78,8 +84,10 @@ contracts = [
     "FeatureFlagModule",
     "LiquidationModule",
     "MarketConfigurationModule",
+    "CollateralConfigurationModule",
     "GlobalPerpsMarketModule",
 ]
+includeDiamondCompatibility = false
 
 [invoke.upgrade_proxy]
 target = ["InitialProxy"]
@@ -127,13 +135,6 @@ target = ["PerpsMarketProxy"]
 func = "setFeatureFlagAllowAll"
 from = "<%= settings.owner %>"
 args = ["<%= formatBytes32String('perpsSystem') %>", true]
-
-# add snxUSD as the only priority to deduct from on a given account, as default
-[invoke.setSynthDeductionPriority]
-target = ["PerpsMarketProxy"]
-func = "setSynthDeductionPriority"
-from = "<%= settings.owner %>"
-args = [[0]]
 
 [contract.MockPythERC7412Wrapper]
 artifact = "contracts/mocks/MockPythERC7412Wrapper.sol:MockPythERC7412Wrapper"

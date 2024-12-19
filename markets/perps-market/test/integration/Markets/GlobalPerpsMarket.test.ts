@@ -1,10 +1,9 @@
-import { BigNumber, ethers } from 'ethers';
+import { ethers } from 'ethers';
 import { bn, bootstrapMarkets } from '../bootstrap';
 import assertBn from '@synthetixio/core-utils/src/utils/assertions/assert-bignumber';
 import assertRevert from '@synthetixio/core-utils/utils/assertions/assert-revert';
 import assert from 'assert';
 import { wei } from '@synthetixio/wei';
-import assertEvent from '@synthetixio/core-utils/utils/assertions/assert-event';
 
 describe('GlobalPerpsMarket', () => {
   const { systems, perpsMarkets, synthMarkets, signers, trader1, superMarketId, owner } =
@@ -17,17 +16,16 @@ describe('GlobalPerpsMarket', () => {
       traderAccountIds: [],
     });
 
-  before(
-    'set maxCollateralAmounts, synthDeductionPriority, minLiquidationRewardUsd, maxLiquidationRewardUsd',
-    async () => {
-      await systems().PerpsMarket.setCollateralConfiguration(
-        perpsMarkets()[0].marketId(),
-        bn(10000)
-      );
-      await systems().PerpsMarket.setSynthDeductionPriority([1, 2]);
-      await systems().PerpsMarket.setKeeperRewardGuards(100, bn(0.001), 500, bn(0.005));
-    }
-  );
+  before('set maxCollateralAmounts, minLiquidationRewardUsd, maxLiquidationRewardUsd', async () => {
+    await systems().PerpsMarket.setCollateralConfiguration(
+      perpsMarkets()[0].marketId(),
+      bn(10000),
+      0,
+      0,
+      0
+    );
+    await systems().PerpsMarket.setKeeperRewardGuards(100, bn(0.001), 500, bn(0.005));
+  });
 
   it('returns the supermarket name', async () => {
     assert.equal(await systems().PerpsMarket.name(superMarketId()), 'SuperMarket Perps Market');
@@ -47,13 +45,9 @@ describe('GlobalPerpsMarket', () => {
   });
 
   it('can call initialize again but will not change the config', async () => {
-    await assertEvent(
-      await systems()
-        .PerpsMarket.connect(owner())
-        .initializeFactory(await trader1().getAddress(), await trader1().getAddress()),
-      'FactoryInitialized(1)',
-      systems().PerpsMarket
-    );
+    await systems()
+      .PerpsMarket.connect(owner())
+      .initializeFactory(await trader1().getAddress(), await trader1().getAddress());
 
     assert.equal(await systems().PerpsMarket.name(superMarketId()), 'SuperMarket Perps Market');
   });
@@ -63,13 +57,6 @@ describe('GlobalPerpsMarket', () => {
       perpsMarkets()[0].marketId()
     );
     assertBn.equal(maxCollateralAmount, bn(10000));
-  });
-
-  it('returns the correct synthDeductionPriority ', async () => {
-    const synths = await systems().PerpsMarket.getSynthDeductionPriority();
-    synths.forEach((synth, index) => {
-      assertBn.equal(synth, BigNumber.from(index + 1));
-    });
   });
 
   it('returns the correct minKeeperRewardUsd ', async () => {
@@ -90,11 +77,7 @@ describe('GlobalPerpsMarket', () => {
     await assertRevert(
       systems()
         .PerpsMarket.connect(trader1())
-        .setCollateralConfiguration(perpsMarkets()[0].marketId(), bn(10000)),
-      `Unauthorized("${await trader1().getAddress()}")`
-    );
-    await assertRevert(
-      systems().PerpsMarket.connect(trader1()).setSynthDeductionPriority([1, 2]),
+        .setCollateralConfiguration(perpsMarkets()[0].marketId(), bn(10000), 0, 0, 0),
       `Unauthorized("${await trader1().getAddress()}")`
     );
   });
@@ -167,7 +150,13 @@ describe('GlobalPerpsMarket', () => {
 
   describe('remove a supported collaterals', () => {
     before('remove a supported collateral by setting its max to zero', async () => {
-      await systems().PerpsMarket.setCollateralConfiguration(perpsMarkets()[0].marketId(), bn(0));
+      await systems().PerpsMarket.setCollateralConfiguration(
+        perpsMarkets()[0].marketId(),
+        bn(0),
+        0,
+        0,
+        0
+      );
     });
 
     it('the removed market was gone from supportedCollaterals', async () => {
