@@ -61,7 +61,7 @@
     "typescript": "^5.5.4"
   },
   "dependencies": {
-    "@ethersproject/abi": "^5.7.0",
+    "@ethersproject/abi": "^5.8.0",
     "chalk": "^4.1.2",
     "ethereumjs-util": "^7.1.5",
     "fast-glob": "^3.3.2",
