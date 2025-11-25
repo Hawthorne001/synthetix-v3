@@ -33,7 +33,7 @@
   },
   "dependencies": {
     "@solidity-parser/parser": "^0.18.0",
-    "@synthetixio/core-utils": "workspace:*",
+    "@synthetixio/core-utils": "1.0.0",
     "chalk": "^4.1.2",
     "cli-table3": "^0.6.5",
     "lodash.memoize": "^4.1.2",
